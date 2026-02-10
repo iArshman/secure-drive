@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, ContentType
 from aiohttp import web
 
 from google_auth_oauthlib.flow import Flow
@@ -20,7 +20,6 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_FILE_SIZE
 from database import Database
-# [CHANGE 1] Import Crypto Module
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 import web as web_module
 
@@ -37,16 +36,22 @@ user_states: Dict[int, dict] = {}
 
 # ============= HELPERS =============
 
-def get_file_icon(mime_type: str, name: str) -> str:
-    if mime_type == 'application/vnd.google-apps.folder': return "📁"
-    name = name.lower()
-    if "video" in mime_type or name.endswith(('.mp4', '.mkv', '.mov', '.avi')): return "🎬"
-    if "audio" in mime_type or name.endswith(('.mp3', '.wav', '.m4a', '.flac')): return "🎵"
-    if "image" in mime_type or name.endswith(('.jpg', '.png', '.webp', '.jpeg')): return "🖼️"
-    if "pdf" in mime_type: return "📕"
-    if "zip" in mime_type or "rar" in mime_type: return "📦"
-    if "text" in mime_type: return "📄"
-    return "📝"
+def get_file_view(mime_type: str, name: str) -> str:
+    """
+    Returns the visual representation for the file button.
+    - Folders: "📁 Name"
+    - Files with Extension: "Name" (Clean)
+    - Files without Extension: "📄 Name" (Marked as garbage/unknown)
+    """
+    if mime_type == 'application/vnd.google-apps.folder': 
+        return f"📁 {name}"
+    
+    # Check if file has an extension (e.g., "video.mp4")
+    if "." in name and not name.endswith("."):
+        return name  # CLEAN VIEW: No emoji, just filename
+        
+    # No extension (Garbage file) -> Add emoji
+    return f"📄 {name}"
 
 def format_file_size(size_bytes):
     if not size_bytes: return "0 B"
@@ -83,19 +88,15 @@ def get_drive_service(access_token: str, refresh_token: str = None):
     }, SCOPES)
     return build('drive', 'v3', credentials=creds)
 
-# ============= CORE RENDERER (Grid UI + Decryption) =============
+# ============= CORE RENDERER =============
 
 async def render_explorer(event, account_id: str, folder_id: str = "root", page_token: str = None, search_query: str = None):
     try:
         account = await db.accounts.find_one({"_id": ObjectId(account_id)})
         service = get_drive_service(account['access_token'], account.get('refresh_token'))
 
-        # [CHANGE 3] Fetch & Process Files for Sorting
-        # We fetch 100 items to allow better local sorting since Drive can't sort encrypted names
         query = f"'{folder_id}' in parents and trashed=false"
         if search_query:
-            # Note: Full search on encrypted names is limited. 
-            # We fetch everything and filter locally (basic implementation)
             query = "trashed=false" 
 
         results = service.files().list(
@@ -108,63 +109,56 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         raw_files = results.get('files', [])
         next_pt = results.get('nextPageToken')
 
-        # --- Decrypt & Sort Layer ---
+        # Decrypt & Sort
         processed_files = []
         for f in raw_files:
-            real_name = decrypt_name(f['name']) # Decrypt Name
-            
-            # Simple Search Filter (if search query exists)
+            real_name = decrypt_name(f['name'])
             if search_query and search_query.lower() not in real_name.lower():
                 continue
-                
             processed_files.append({
-                'id': f['id'],
-                'name': real_name,
-                'mimeType': f['mimeType'],
-                'size': f.get('size')
+                'id': f['id'], 'name': real_name, 'mimeType': f['mimeType'], 'size': f.get('size')
             })
 
-        # Sort: Folders first, then Files (A-Z)
         processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
-        # ----------------------------
 
-        # Get Folder Name
         if folder_id == "root":
             title = "🔐 Root (Encrypted)"
         else:
             meta = service.files().get(fileId=folder_id, fields='name').execute()
             title = decrypt_name(meta.get('name'))
 
-        # Text Header
         text = f"📂 <b>{escape_html(title)}</b>\n"
-        text += f"👤 <code>{escape_html(account.get('email', 'Unknown Account'))}</code>\n"
+        text += f"👤 <code>{escape_html(account.get('email', 'Unknown'))}</code>\n"
         text += "━━━━━━━━━━━━━━━━━━\n"
         if not processed_files: text += "<i>Empty folder.</i>"
 
         keyboard = []
         
-        # 1. Folders (List View)
+        # Folders
         folders = [f for f in processed_files if f['mimeType'] == 'application/vnd.google-apps.folder']
         for f in folders:
             h = await store_file_data(account_id, f['id'], folder_id)
-            keyboard.append([InlineKeyboardButton(text=f"📁 {f['name']}", callback_data=f"open:{h}")])
+            # Folders always have emoji
+            keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
-        # 2. Files (Grid View - 2 Columns)
+        # Files (Grid View)
         only_files = [f for f in processed_files if f['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(only_files), 2):
             row = []
             for f in only_files[i:i+2]:
                 h = await store_file_data(account_id, f['id'], folder_id)
-                icon = get_file_icon(f['mimeType'], f['name'])
-                row.append(InlineKeyboardButton(text=f"{icon} {f['name'][:12]}", callback_data=f"info:{h}"))
+                # Files use Clean View (No emoji)
+                btn_text = get_file_view(f['mimeType'], f['name'])
+                # Truncate long names to 15 chars for grid
+                if len(btn_text) > 15: btn_text = btn_text[:15] + ".."
+                
+                row.append(InlineKeyboardButton(text=btn_text, callback_data=f"info:{h}"))
             keyboard.append(row)
 
-        # 3. Pagination
         if next_pt:
             nh = await store_file_data(account_id, folder_id, folder_id, next_pt)
             keyboard.append([InlineKeyboardButton(text="➡️ Next Page", callback_data=f"page:{nh}")])
 
-        # 4. Controls
         controls = []
         if not search_query:
             if folder_id != "root":
@@ -189,14 +183,12 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         else: await event.answer(err_text)
 
 async def render_file_info(callback: CallbackQuery, h: str):
-    """Helper to render file info page"""
     f_data = await db.callback_data.find_one({"hash": h})
     if f_data:
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
         service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
-        f = service.files().get(fileId=f_data['file_id'], fields="id, name, size, mimeType, webViewLink, modifiedTime").execute()
+        f = service.files().get(fileId=f_data['file_id'], fields="id, name, size, mimeType, modifiedTime").execute()
         
-        # Decrypt Name
         real_name = decrypt_name(f['name'])
         
         text = (f"📄 <b>File Details</b>\n"
@@ -219,23 +211,10 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     if not await db.get_user(user_id):
         await db.create_user(user_id, message.from_user.username, message.from_user.full_name)
-    
-    await message.answer(
-        "👋 <b>Welcome to Cloudyte Secure Drive!</b>\n\n"
-        "All files are <b>End-to-End Encrypted</b>.\n\n"
-        "Commands:\n"
-        "/files - File Manager\n"
-        "/search - Search Files\n"
-        "/upload - Secure Upload\n"
-        "/storage - Check Space\n"
-        "/settings - Manage Accounts\n"
-        "/addaccount - Add New Drive",
-        parse_mode="HTML"
-    )
+    await message.answer("👋 <b>Welcome to Cloudyte Secure Drive!</b>\n\n/files - File Manager\n/upload - Secure Upload\n/addaccount - Link Drive", parse_mode="HTML")
 
 async def cmd_files(message: Message):
-    acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or \
-          await db.accounts.find_one({"user_id": message.from_user.id})
+    acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or await db.accounts.find_one({"user_id": message.from_user.id})
     if not acc: return await message.answer("⚠️ No account linked. Use /addaccount")
     await render_explorer(message, str(acc['_id']), "root")
 
@@ -245,30 +224,18 @@ async def cmd_search(message: Message):
 
 async def cmd_upload(message: Message):
     user_states[message.from_user.id] = {"action": "upload_file", "parent_id": "root"}
-    await message.answer("📤 Send the file to <b>Encrypt & Upload</b>:", parse_mode="HTML")
+    await message.answer("📤 Send the file (Document, Video, Audio, or Photo) now:", parse_mode="HTML")
 
 async def cmd_storage(message: Message):
     user_id = message.from_user.id
     acc = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or await db.accounts.find_one({"user_id": user_id})
     if not acc: return await message.answer("No account connected.")
-    
     try:
         service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
         about = service.about().get(fields="storageQuota, user").execute()
         quota = about.get('storageQuota', {})
-        usage = int(quota.get('usage', 0))
-        limit = int(quota.get('limit', 0))
-        
-        used_gb = usage / (1024**3)
-        total_gb = limit / (1024**3)
-        percent = (usage / limit * 100) if limit > 0 else 0
-        
-        text = (
-            f"💾 <b>Storage: {escape_html(acc['email'])}</b>\n"
-            f"Used: {used_gb:.2f} GB ({percent:.1f}%)\n"
-            f"Total: {total_gb:.2f} GB"
-        )
-        await message.answer(text, parse_mode="HTML")
+        usage = int(quota.get('usage', 0)); limit = int(quota.get('limit', 0))
+        await message.answer(f"💾 <b>Storage:</b> {usage/(1024**3):.2f} GB / {limit/(1024**3):.2f} GB", parse_mode="HTML")
     except Exception as e:
         await message.answer(f"Error: {str(e)}")
 
@@ -276,15 +243,12 @@ async def cmd_settings(message: Message):
     user_id = message.from_user.id
     accounts = await db.accounts.find({"user_id": user_id}).to_list(length=10)
     if not accounts: return await message.answer("No accounts.")
-    
     default = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or accounts[0]
-    
     text = f"⚙️ <b>Settings</b>\nDefault: {escape_html(default['email'])}"
     kb = []
     for acc in accounts:
         is_def = "✅ " if acc.get('_id') == default.get('_id') else ""
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
-    
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
 async def cmd_add(message: Message):
@@ -316,14 +280,10 @@ async def handle_callback(callback: CallbackQuery):
     elif data.startswith("info:"):
         await render_file_info(callback, data.split(":")[1])
 
-    # === DELETE CONFIRMATION LOGIC ===
     elif data.startswith("del:"):
         h = data.split(":")[1]
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Yes, Delete", callback_data=f"del_yes:{h}")],
-            [InlineKeyboardButton(text="❌ No, Cancel", callback_data=f"del_no:{h}")]
-        ])
-        await callback.message.edit_text("⚠️ <b>Delete Confirmation</b>\n\nAre you sure you want to delete this file?\nThis action cannot be undone.", reply_markup=kb, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Yes, Delete", callback_data=f"del_yes:{h}")], [InlineKeyboardButton(text="❌ No, Cancel", callback_data=f"del_no:{h}")]])
+        await callback.message.edit_text("⚠️ Are you sure?", reply_markup=kb, parse_mode="HTML")
 
     elif data.startswith("del_yes:"):
         h = data.split(":")[1]
@@ -334,14 +294,12 @@ async def handle_callback(callback: CallbackQuery):
             await callback.answer("✅ File Deleted!")
             await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
         except Exception as e:
-            await callback.answer(f"Failed to delete: {e}", show_alert=True)
+            await callback.answer(f"Failed: {e}", show_alert=True)
 
     elif data.startswith("del_no:"):
         h = data.split(":")[1]
         await render_file_info(callback, h)
-    # =================================
 
-    # [CHANGE 5] Decrypt Download
     elif data.startswith("down:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
@@ -349,28 +307,19 @@ async def handle_callback(callback: CallbackQuery):
         service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
         f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
         
-        real_name = decrypt_name(f_meta['name']) # Get Real Name
-        
+        real_name = decrypt_name(f_meta['name'])
         if int(f_meta.get('size', 0)) > 50 * 1024 * 1024:
-            return await callback.answer("⚠️ File > 50MB. Cannot upload to Telegram.", show_alert=True)
+            return await callback.answer("⚠️ File > 50MB. Cannot download.", show_alert=True)
         
-        await callback.answer("⏳ Downloading & Decrypting...", show_alert=False)
-        
-        # 1. Download Encrypted Stream
+        await callback.answer("⏳ Downloading...", show_alert=False)
         request = service.files().get_media(fileId=f_data['file_id'])
         file_io = io.BytesIO()
         downloader = MediaIoBaseDownload(file_io, request)
         done = False
         while not done: _, done = downloader.next_chunk()
-        
-        # 2. Decrypt Content
         file_io.seek(0)
         decrypted_bytes = decrypt_data(file_io.read())
-        
-        # 3. Send
-        await callback.message.answer_document(
-            BufferedInputFile(decrypted_bytes, filename=real_name)
-        )
+        await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("ren:"):
         user_states[user_id] = {"action": "rename", "hash": data.split(":")[1]}
@@ -393,25 +342,19 @@ async def handle_callback(callback: CallbackQuery):
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
         await render_explorer(callback, str(acc['_id']), "root")
     
-    # Settings Logic
     elif data.startswith("sett_acc:"):
         acc_id = data.split(":")[1]
-        kb = [[InlineKeyboardButton(text="⭐ Make Default", callback_data=f"mk_def:{acc_id}")],
-              [InlineKeyboardButton(text="🗑 Delete Account", callback_data=f"rm_acc:{acc_id}")],
-              [InlineKeyboardButton(text="🔙 Back", callback_data="back_set")]]
+        kb = [[InlineKeyboardButton(text="⭐ Make Default", callback_data=f"mk_def:{acc_id}")], [InlineKeyboardButton(text="🗑 Delete", callback_data=f"rm_acc:{acc_id}")], [InlineKeyboardButton(text="🔙 Back", callback_data="back_set")]]
         await callback.message.edit_text("Select Action:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
     elif data.startswith("mk_def:"):
-        acc_id = data.split(":")[1]
         await db.accounts.update_many({"user_id": user_id}, {"$set": {"is_default": False}})
-        await db.accounts.update_one({"_id": ObjectId(acc_id)}, {"$set": {"is_default": True}})
-        await callback.answer("✅ Default Updated!")
-        await cmd_settings(callback.message)
+        await db.accounts.update_one({"_id": ObjectId(data.split(":")[1])}, {"$set": {"is_default": True}})
+        await callback.answer("✅ Updated!"); await cmd_settings(callback.message)
 
     elif data.startswith("rm_acc:"):
         await db.accounts.delete_one({"_id": ObjectId(data.split(":")[1])})
-        await callback.answer("🗑 Account Removed")
-        await cmd_settings(callback.message)
+        await callback.answer("🗑 Removed"); await cmd_settings(callback.message)
     
     elif data == "back_set":
         await cmd_settings(callback.message)
@@ -427,60 +370,47 @@ async def handle_user_input(message: Message):
     acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or await db.accounts.find_one({"user_id": message.from_user.id})
     service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
 
-    # Search
     if state['action'] == "search":
         del user_states[message.from_user.id]
-        # Pass search query to renderer (Note: search happens on decrypted names in render_explorer)
         await render_explorer(message, str(acc['_id']), "root", search_query=message.text)
 
-    # Rename
     elif state['action'] == "rename":
         f_data = await db.callback_data.find_one({"hash": state['hash']})
-        new_enc_name = encrypt_name(message.text) # Encrypt New Name
-        service.files().update(fileId=f_data['file_id'], body={'name': new_enc_name}).execute()
-        await message.answer(f"✅ Renamed to {message.text}")
-        del user_states[message.from_user.id]
+        service.files().update(fileId=f_data['file_id'], body={'name': encrypt_name(message.text)}).execute()
+        await message.answer(f"✅ Renamed to {message.text}"); del user_states[message.from_user.id]
         await render_explorer(message, f_data['account_id'], f_data['parent_id'])
 
-    # Create Folder
     elif state['action'] == "create_folder":
-        enc_name = encrypt_name(message.text) # Encrypt Folder Name
-        meta = {
-            'name': enc_name, 
-            'mimeType': 'application/vnd.google-apps.folder', 
-            'parents': [state['parent_id']] if state['parent_id'] != "root" else []
-        }
+        meta = {'name': encrypt_name(message.text), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
         service.files().create(body=meta).execute()
-        await message.answer(f"✅ Folder '{message.text}' created!")
-        del user_states[message.from_user.id]
+        await message.answer(f"✅ Folder Created!"); del user_states[message.from_user.id]
         await render_explorer(message, str(acc['_id']), state['parent_id'])
 
-    # [CHANGE 4] Encrypted Upload
-    elif state['action'] == "upload_file" and message.document:
-        msg = await message.answer("⏳ Encrypting & Uploading...")
-        
-        # 1. Download
-        file_io = await bot.download(message.document)
-        raw_bytes = file_io.read()
-        
-        # 2. Encrypt Content
-        enc_bytes = encrypt_data(raw_bytes)
-        
-        # 3. Encrypt Name
-        enc_name = encrypt_name(message.document.file_name)
-        
-        # 4. Upload
-        meta = {
-            'name': enc_name, 
-            'parents': [state['parent_id']] if state['parent_id'] != "root" else []
-        }
-        media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
-        
-        service.files().create(body=meta, media_body=media).execute()
-        
-        await msg.edit_text("✅ Secure Upload Complete!")
-        del user_states[message.from_user.id]
-        await render_explorer(message, str(acc['_id']), state['parent_id'])
+    elif state['action'] == "upload_file":
+        file_obj = None; filename = "untitled"; mime = "application/octet-stream"
+
+        if message.document:
+            file_obj = message.document; filename = message.document.file_name; mime = message.document.mime_type
+        elif message.video:
+            file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"; mime = message.video.mime_type
+        elif message.audio:
+            file_obj = message.audio; filename = message.audio.file_name; mime = message.audio.mime_type
+        elif message.photo:
+            file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"; mime = "image/jpeg"
+
+        if file_obj:
+            msg = await message.answer(f"⏳ Encrypting & Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+            try:
+                file_io = await bot.download(file_obj)
+                enc_bytes = encrypt_data(file_io.read())
+                meta = {'name': encrypt_name(filename), 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+                media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype=mime)
+                service.files().create(body=meta, media_body=media).execute()
+                await msg.edit_text("✅ Secure Upload Complete!")
+                del user_states[message.from_user.id]
+                await render_explorer(message, str(acc['_id']), state['parent_id'])
+            except Exception as e:
+                await msg.edit_text(f"❌ Error: {e}")
 
 # ============= MAIN =============
 
@@ -490,17 +420,13 @@ async def main():
     db = Database()
     dp = Dispatcher()
     
-    # [CHANGE 2] Load Encryption Key
-    print("⏳ Loading Encryption Key...")
     try:
         key = await db.get_or_create_encryption_key()
         init_cipher(key)
         print("✅ Cipher Initialized")
     except Exception as e:
-        print(f"❌ Failed to load key: {e}")
-        return
+        print(f"❌ Key Error: {e}"); return
 
-    # Command Registration
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_files, Command("files"))
     dp.message.register(cmd_search, Command("search"))
@@ -509,11 +435,10 @@ async def main():
     dp.message.register(cmd_settings, Command("settings"))
     dp.message.register(cmd_add, Command("addaccount"))
     
-    # Handlers
-    dp.message.register(handle_user_input, F.text | F.document)
+    # Listen for ALL file types
+    dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
-    # Web Module
     web_module.setup_web_module(bot, db, oauth_states, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
     app = web_module.create_web_app()
     runner = web.AppRunner(app)
