@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, ContentType
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiohttp import web
 
 from google_auth_oauthlib.flow import Flow
@@ -18,7 +18,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
-from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_FILE_SIZE
+from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 import web as web_module
@@ -34,23 +34,23 @@ dp: Optional[Dispatcher] = None
 oauth_states: Dict[str, dict] = {}
 user_states: Dict[int, dict] = {}
 
-# ============= HELPERS =============
+# ============= UI HELPERS =============
 
 def get_file_view(mime_type: str, name: str) -> str:
     """
-    Returns the visual representation for the file button.
-    - Folders: "📁 Name"
-    - Files with Extension: "Name" (Clean)
-    - Files without Extension: "📄 Name" (Marked as garbage/unknown)
+    Controls how the file button looks.
     """
+    # 1. Folders need an icon to be clickable/recognizable
     if mime_type == 'application/vnd.google-apps.folder': 
         return f"📁 {name}"
     
-    # Check if file has an extension (e.g., "video.mp4")
+    # 2. Files with Extension -> Clean View (No Emoji)
+    # Example: "video.mp4" stays "video.mp4"
     if "." in name and not name.endswith("."):
-        return name  # CLEAN VIEW: No emoji, just filename
+        return name
         
-    # No extension (Garbage file) -> Add emoji
+    # 3. Files WITHOUT Extension -> Add Generic Emoji
+    # Example: "passwords" becomes "📄 passwords"
     return f"📄 {name}"
 
 def format_file_size(size_bytes):
@@ -88,7 +88,7 @@ def get_drive_service(access_token: str, refresh_token: str = None):
     }, SCOPES)
     return build('drive', 'v3', credentials=creds)
 
-# ============= CORE RENDERER =============
+# ============= EXPLORER =============
 
 async def render_explorer(event, account_id: str, folder_id: str = "root", page_token: str = None, search_query: str = None):
     try:
@@ -122,7 +122,7 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
 
         if folder_id == "root":
-            title = "🔐 Root (Encrypted)"
+            title = "🔐 Root"
         else:
             meta = service.files().get(fileId=folder_id, fields='name').execute()
             title = decrypt_name(meta.get('name'))
@@ -138,19 +138,18 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         folders = [f for f in processed_files if f['mimeType'] == 'application/vnd.google-apps.folder']
         for f in folders:
             h = await store_file_data(account_id, f['id'], folder_id)
-            # Folders always have emoji
+            # Folders always show emoji
             keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
-        # Files (Grid View)
+        # Files
         only_files = [f for f in processed_files if f['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(only_files), 2):
             row = []
             for f in only_files[i:i+2]:
                 h = await store_file_data(account_id, f['id'], folder_id)
-                # Files use Clean View (No emoji)
+                # CLEAN UI: No emoji if extension exists
                 btn_text = get_file_view(f['mimeType'], f['name'])
-                # Truncate long names to 15 chars for grid
-                if len(btn_text) > 15: btn_text = btn_text[:15] + ".."
+                if len(btn_text) > 20: btn_text = btn_text[:20] + ".."
                 
                 row.append(InlineKeyboardButton(text=btn_text, callback_data=f"info:{h}"))
             keyboard.append(row)
@@ -205,13 +204,13 @@ async def render_file_info(callback: CallbackQuery, h: str):
         ])
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
-# ============= COMMAND HANDLERS =============
+# ============= COMMANDS =============
 
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     if not await db.get_user(user_id):
         await db.create_user(user_id, message.from_user.username, message.from_user.full_name)
-    await message.answer("👋 <b>Welcome to Cloudyte Secure Drive!</b>\n\n/files - File Manager\n/upload - Secure Upload\n/addaccount - Link Drive", parse_mode="HTML")
+    await message.answer("👋 <b>Cloudyte Secure Drive</b>\n\n/files - File Manager\n/upload - Secure Upload\n/addaccount - Link Drive", parse_mode="HTML")
 
 async def cmd_files(message: Message):
     acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or await db.accounts.find_one({"user_id": message.from_user.id})
@@ -224,7 +223,7 @@ async def cmd_search(message: Message):
 
 async def cmd_upload(message: Message):
     user_states[message.from_user.id] = {"action": "upload_file", "parent_id": "root"}
-    await message.answer("📤 Send the file (Document, Video, Audio, or Photo) now:", parse_mode="HTML")
+    await message.answer("📤 Send any file (Video/Audio/Photo/Doc) now:", parse_mode="HTML")
 
 async def cmd_storage(message: Message):
     user_id = message.from_user.id
@@ -261,7 +260,7 @@ async def cmd_add(message: Message):
     auth_url, _ = flow.authorization_url(access_type='offline', state=state_key, prompt='consent')
     await message.answer("🔐 Link Account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]]))
 
-# ============= CALLBACK HANDLERS =============
+# ============= ACTIONS =============
 
 async def handle_callback(callback: CallbackQuery):
     data = callback.data
@@ -282,8 +281,8 @@ async def handle_callback(callback: CallbackQuery):
 
     elif data.startswith("del:"):
         h = data.split(":")[1]
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Yes, Delete", callback_data=f"del_yes:{h}")], [InlineKeyboardButton(text="❌ No, Cancel", callback_data=f"del_no:{h}")]])
-        await callback.message.edit_text("⚠️ Are you sure?", reply_markup=kb, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Yes", callback_data=f"del_yes:{h}"), InlineKeyboardButton(text="❌ No", callback_data=f"del_no:{h}")]])
+        await callback.message.edit_text("⚠️ Delete this file?", reply_markup=kb, parse_mode="HTML")
 
     elif data.startswith("del_yes:"):
         h = data.split(":")[1]
@@ -291,7 +290,7 @@ async def handle_callback(callback: CallbackQuery):
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
         try:
             get_drive_service(acc['access_token'], acc.get('refresh_token')).files().delete(fileId=f_data['file_id']).execute()
-            await callback.answer("✅ File Deleted!")
+            await callback.answer("✅ Deleted")
             await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
         except Exception as e:
             await callback.answer(f"Failed: {e}", show_alert=True)
@@ -309,7 +308,7 @@ async def handle_callback(callback: CallbackQuery):
         
         real_name = decrypt_name(f_meta['name'])
         if int(f_meta.get('size', 0)) > 50 * 1024 * 1024:
-            return await callback.answer("⚠️ File > 50MB. Cannot download.", show_alert=True)
+            return await callback.answer("⚠️ File > 50MB", show_alert=True)
         
         await callback.answer("⏳ Downloading...", show_alert=False)
         request = service.files().get_media(fileId=f_data['file_id'])
@@ -350,7 +349,7 @@ async def handle_callback(callback: CallbackQuery):
     elif data.startswith("mk_def:"):
         await db.accounts.update_many({"user_id": user_id}, {"$set": {"is_default": False}})
         await db.accounts.update_one({"_id": ObjectId(data.split(":")[1])}, {"$set": {"is_default": True}})
-        await callback.answer("✅ Updated!"); await cmd_settings(callback.message)
+        await callback.answer("✅ Updated"); await cmd_settings(callback.message)
 
     elif data.startswith("rm_acc:"):
         await db.accounts.delete_one({"_id": ObjectId(data.split(":")[1])})
@@ -361,7 +360,7 @@ async def handle_callback(callback: CallbackQuery):
 
     await callback.answer()
 
-# ============= USER INPUT =============
+# ============= UPLOAD & INPUT =============
 
 async def handle_user_input(message: Message):
     state = user_states.get(message.from_user.id)
@@ -377,36 +376,39 @@ async def handle_user_input(message: Message):
     elif state['action'] == "rename":
         f_data = await db.callback_data.find_one({"hash": state['hash']})
         service.files().update(fileId=f_data['file_id'], body={'name': encrypt_name(message.text)}).execute()
-        await message.answer(f"✅ Renamed to {message.text}"); del user_states[message.from_user.id]
+        await message.answer(f"✅ Renamed"); del user_states[message.from_user.id]
         await render_explorer(message, f_data['account_id'], f_data['parent_id'])
 
     elif state['action'] == "create_folder":
         meta = {'name': encrypt_name(message.text), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
         service.files().create(body=meta).execute()
-        await message.answer(f"✅ Folder Created!"); del user_states[message.from_user.id]
+        await message.answer(f"✅ Created"); del user_states[message.from_user.id]
         await render_explorer(message, str(acc['_id']), state['parent_id'])
 
     elif state['action'] == "upload_file":
-        file_obj = None; filename = "untitled"; mime = "application/octet-stream"
-
-        if message.document:
-            file_obj = message.document; filename = message.document.file_name; mime = message.document.mime_type
-        elif message.video:
-            file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"; mime = message.video.mime_type
-        elif message.audio:
-            file_obj = message.audio; filename = message.audio.file_name; mime = message.audio.mime_type
-        elif message.photo:
-            file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"; mime = "image/jpeg"
+        file_obj = None; filename = "untitled"
+        # We ignore message.video.mime_type etc and force binary below
+        if message.document: file_obj = message.document; filename = message.document.file_name
+        elif message.video: file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"
+        elif message.audio: file_obj = message.audio; filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
+        elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
         if file_obj:
-            msg = await message.answer(f"⏳ Encrypting & Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+            msg = await message.answer(f"⏳ Encrypting <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             try:
                 file_io = await bot.download(file_obj)
                 enc_bytes = encrypt_data(file_io.read())
-                meta = {'name': encrypt_name(filename), 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
-                media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype=mime)
+                
+                # Encrypt Name (NO EXTENSION PRESERVED)
+                enc_name = encrypt_name(filename)
+                
+                meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+                
+                # FORCE BINARY MIME TYPE -> Google sees "Unknown File"
+                media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                
                 service.files().create(body=meta, media_body=media).execute()
-                await msg.edit_text("✅ Secure Upload Complete!")
+                await msg.edit_text("✅ Uploaded")
                 del user_states[message.from_user.id]
                 await render_explorer(message, str(acc['_id']), state['parent_id'])
             except Exception as e:
@@ -435,7 +437,6 @@ async def main():
     dp.message.register(cmd_settings, Command("settings"))
     dp.message.register(cmd_add, Command("addaccount"))
     
-    # Listen for ALL file types
     dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
