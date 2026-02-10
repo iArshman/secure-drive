@@ -18,7 +18,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
-# [CHANGE] Imported new limits from config
+# [FIX] Updated Imports to match new config.py
 from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
@@ -38,16 +38,15 @@ user_states: Dict[int, dict] = {}
 # ============= MENU SETUP =============
 
 async def set_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Start Bot"),
-        BotCommand(command="files", description="File Manager"),
-        BotCommand(command="upload", description="Secure Upload"),
-        BotCommand(command="search", description="Search Files"),
-        BotCommand(command="storage", description="Check Storage"),
-        BotCommand(command="settings", description="Settings"),
-        BotCommand(command="addaccount", description="Add Drive")
-
-    ]
+    commands = [BotCommand(command=c, description=d) for c, d in [
+        ("start", "Start Bot"),
+        ("files", "File Manager"),
+        ("upload", "Secure Upload"),
+        ("search", "Search Files"),
+        ("storage", "Check Storage"),
+        ("settings", "Settings"),
+        ("addaccount", "Add Drive")
+    ]]
     await bot.set_my_commands(commands)
 
 # ============= HELPERS =============
@@ -116,7 +115,12 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
 
         processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
 
-        title = "🔐 Root" if folder_id == "root" else decrypt_name(service.files().get(fileId=folder_id, fields='name').execute().get('name'))
+        title = "🔐 Root"
+        if folder_id != "root":
+            try:
+                meta = service.files().get(fileId=folder_id, fields='name').execute()
+                title = decrypt_name(meta.get('name'))
+            except: pass
         
         text = f"📂 <b>{escape_html(title)}</b>\n👤 <code>{escape_html(account.get('email', 'Unknown'))}</code>\n━━━━━━━━━━━━━━━━━━\n"
         if not processed_files: text += "<i>Empty folder.</i>"
@@ -291,7 +295,7 @@ async def handle_callback(callback: CallbackQuery):
         f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
         real_name = decrypt_name(f_meta['name'])
         
-        # [CHANGE] Check Download Limit from CONFIG
+        # [CHECK] Download Limit from CONFIG
         file_size = int(f_meta.get('size', 0))
         if file_size > MAX_DOWNLOAD_SIZE:
             return await callback.answer(f"⚠️ File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
@@ -327,6 +331,7 @@ async def handle_callback(callback: CallbackQuery):
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
         await render_explorer(callback, str(acc['_id']), "root")
     
+    # [FIX] SETTINGS CALLBACKS
     elif data.startswith("sett_acc:"):
         acc_id = data.split(":")[1]
         kb = [[InlineKeyboardButton(text="⭐ Make Default", callback_data=f"mk_def:{acc_id}")],
@@ -383,7 +388,7 @@ async def handle_user_input(message: Message):
         elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
         if file_obj:
-            # [CHANGE] Check Upload Limit from CONFIG
+            # [CHECK] Upload Limit from CONFIG
             if file_obj.file_size > MAX_UPLOAD_SIZE:
                 await message.answer(f"❌ File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
                 return
@@ -394,6 +399,7 @@ async def handle_user_input(message: Message):
                 enc_bytes = encrypt_data(file_io.read())
                 enc_name = encrypt_name(filename)
                 meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+                # Force Octet-Stream
                 media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                 service.files().create(body=meta, media_body=media).execute()
                 await msg.edit_text("✅ Uploaded")
