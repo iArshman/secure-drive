@@ -18,7 +18,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
-from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_FILE_SIZE
+# [CHANGE] Imported new limits from config
+from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 import web as web_module
@@ -38,13 +39,14 @@ user_states: Dict[int, dict] = {}
 
 async def set_bot_commands(bot: Bot):
     commands = [
-        BotCommand(command="files", description="📂 File Manager"),
-        BotCommand(command="upload", description="⬆️ Secure Upload"),
-        BotCommand(command="search", description="🔍 Search Files"),
-        BotCommand(command="storage", description="💾 Check Storage"),
-        BotCommand(command="settings", description="⚙️ Settings"),
-        BotCommand(command="addaccount", description="➕ Add Drive"),
-        BotCommand(command="start", description="👋 Restart Bot")
+        BotCommand(command="start", description="Start Bot"),
+        BotCommand(command="files", description="File Manager"),
+        BotCommand(command="upload", description="Secure Upload"),
+        BotCommand(command="search", description="Search Files"),
+        BotCommand(command="storage", description="Check Storage"),
+        BotCommand(command="settings", description="Settings"),
+        BotCommand(command="addaccount", description="Add Drive")
+
     ]
     await bot.set_my_commands(commands)
 
@@ -120,12 +122,10 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         if not processed_files: text += "<i>Empty folder.</i>"
 
         keyboard = []
-        # Folders
         for f in [x for x in processed_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
             h = await store_file_data(account_id, f['id'], folder_id)
             keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
-        # Files
         files_list = [x for x in processed_files if x['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(files_list), 2):
             row = []
@@ -177,10 +177,8 @@ async def render_file_info(callback: CallbackQuery, h: str):
         ])
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
-# [FIX] New Dedicated Settings Renderer
 async def render_settings(event, user_id: int):
     accounts = await db.accounts.find({"user_id": user_id}).to_list(length=10)
-    
     if not accounts:
         msg = "⚠️ <b>No accounts found.</b>\nUse /addaccount to link a Google Drive."
         if isinstance(event, Message): await event.answer(msg, parse_mode="HTML")
@@ -196,7 +194,6 @@ async def render_settings(event, user_id: int):
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
     
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    
     if isinstance(event, Message): await event.answer(text, reply_markup=markup, parse_mode="HTML")
     else: await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -235,7 +232,6 @@ async def cmd_storage(message: Message):
         await message.answer(f"Error: {str(e)}")
 
 async def cmd_settings(message: Message):
-    # [FIX] Call the renderer with the Message sender's ID
     await render_settings(message, message.from_user.id)
 
 async def cmd_add(message: Message):
@@ -295,8 +291,10 @@ async def handle_callback(callback: CallbackQuery):
         f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
         real_name = decrypt_name(f_meta['name'])
         
-        if int(f_meta.get('size', 0)) > 50 * 1024 * 1024:
-            return await callback.answer("⚠️ File > 50MB", show_alert=True)
+        # [CHANGE] Check Download Limit from CONFIG
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return await callback.answer(f"⚠️ File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
         
         await callback.answer("⏳ Downloading...", show_alert=False)
         request = service.files().get_media(fileId=f_data['file_id'])
@@ -329,7 +327,6 @@ async def handle_callback(callback: CallbackQuery):
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
         await render_explorer(callback, str(acc['_id']), "root")
     
-    # [FIX] Settings Callbacks
     elif data.startswith("sett_acc:"):
         acc_id = data.split(":")[1]
         kb = [[InlineKeyboardButton(text="⭐ Make Default", callback_data=f"mk_def:{acc_id}")],
@@ -338,19 +335,18 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.edit_text("Manage Account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
     elif data.startswith("mk_def:"):
-        # Explicitly use user_id from callback
         await db.accounts.update_many({"user_id": user_id}, {"$set": {"is_default": False}})
         await db.accounts.update_one({"_id": ObjectId(data.split(":")[1])}, {"$set": {"is_default": True}})
         await callback.answer("✅ Updated")
-        await render_settings(callback, user_id) # Call render directly
+        await render_settings(callback, user_id)
 
     elif data.startswith("rm_acc:"):
         await db.accounts.delete_one({"_id": ObjectId(data.split(":")[1])})
         await callback.answer("🗑 Removed")
-        await render_settings(callback, user_id) # Call render directly
+        await render_settings(callback, user_id)
     
     elif data == "back_set":
-        await render_settings(callback, user_id) # Call render directly
+        await render_settings(callback, user_id)
 
     await callback.answer()
 
@@ -387,11 +383,17 @@ async def handle_user_input(message: Message):
         elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
         if file_obj:
+            # [CHANGE] Check Upload Limit from CONFIG
+            if file_obj.file_size > MAX_UPLOAD_SIZE:
+                await message.answer(f"❌ File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
+                return
+
             msg = await message.answer(f"⏳ Encrypting <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             try:
                 file_io = await bot.download(file_obj)
                 enc_bytes = encrypt_data(file_io.read())
-                meta = {'name': encrypt_name(filename), 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+                enc_name = encrypt_name(filename)
+                meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
                 media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                 service.files().create(body=meta, media_body=media).execute()
                 await msg.edit_text("✅ Uploaded")
@@ -415,7 +417,6 @@ async def main():
     except Exception as e:
         print(f"❌ Key Error: {e}"); return
 
-    # [FIX] SET MENU COMMANDS
     await set_bot_commands(bot)
 
     dp.message.register(cmd_start, CommandStart())
