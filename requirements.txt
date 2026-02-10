@@ -6,3 +6,4 @@ google-auth
 cryptography
 aiohttp
 dnspython
+python-dotenv
