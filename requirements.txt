@@ -1,0 +1,8 @@
+aiogram
+motor
+google-api-python-client
+google-auth-oauthlib
+google-auth
+cryptography
+aiohttp
+dnspython
