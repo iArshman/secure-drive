@@ -41,7 +41,6 @@ async def set_bot_commands(bot: Bot):
     commands = [BotCommand(command=c, description=d) for c, d in [
         ("start", "Start Bot"),
         ("files", "File Manager"),
-        ("upload", "Secure Upload"),
         ("search", "Search Files"),
         ("storage", "Check Storage"),
         ("settings", "Settings"),
@@ -175,9 +174,9 @@ async def render_file_info(callback: CallbackQuery, h: str):
                 f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📥 Decrypt & Download", callback_data=f"down:{h}")],
-            [InlineKeyboardButton(text="✏️ Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="🗑 Delete", callback_data=f"del:{h}")],
-            [InlineKeyboardButton(text="🔙 Back", callback_data=f"open_parent:{h}")]
+            [InlineKeyboardButton(text="Download", callback_data=f"down:{h}")],
+            [InlineKeyboardButton(text="Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="Delete", callback_data=f"del:{h}")],
+            [InlineKeyboardButton(text="Back", callback_data=f"open_parent:{h}")]
         ])
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
@@ -194,7 +193,7 @@ async def render_settings(event, user_id: int):
     text = f"⚙️ <b>Settings</b>\n\n<b>Default Account:</b>\n{escape_html(default['email'])}\n\n👇 <i>Click an account to manage:</i>"
     kb = []
     for acc in accounts:
-        is_def = "✅ " if acc.get('_id') == default.get('_id') else "Running "
+        is_def = "✅ " if acc.get('_id') == default.get('_id') else ""
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
     
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
@@ -207,7 +206,7 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     if not await db.get_user(user_id):
         await db.create_user(user_id, message.from_user.username, message.from_user.full_name)
-    await message.answer("👋 <b>Cloudyte Secure Drive</b>\n\n/files - File Manager\n/upload - Secure Upload\n/addaccount - Link Drive", parse_mode="HTML")
+    await message.answer("👋 <b>Cloudyte Secure Drive</b>", parse_mode="HTML")
 
 async def cmd_files(message: Message):
     acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or await db.accounts.find_one({"user_id": message.from_user.id})
@@ -216,11 +215,7 @@ async def cmd_files(message: Message):
 
 async def cmd_search(message: Message):
     user_states[message.from_user.id] = {"action": "search"}
-    await message.answer("🔍 Enter the file name to search:")
-
-async def cmd_upload(message: Message):
-    user_states[message.from_user.id] = {"action": "upload_file", "parent_id": "root"}
-    await message.answer("📤 Send any file (Video/Audio/Photo/Doc) now:", parse_mode="HTML")
+    await message.answer(" Enter the file name to search:")
 
 async def cmd_storage(message: Message):
     user_id = message.from_user.id
@@ -300,7 +295,7 @@ async def handle_callback(callback: CallbackQuery):
         if file_size > MAX_DOWNLOAD_SIZE:
             return await callback.answer(f"⚠️ File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
         
-        await callback.answer("⏳ Downloading...", show_alert=False)
+        await callback.answer(" Downloading...", show_alert=False)
         request = service.files().get_media(fileId=f_data['file_id'])
         file_io = io.BytesIO()
         downloader = MediaIoBaseDownload(file_io, request)
@@ -393,7 +388,7 @@ async def handle_user_input(message: Message):
                 await message.answer(f"❌ File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
                 return
 
-            msg = await message.answer(f"⏳ Encrypting <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+            msg = await message.answer(f"Encrypting <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             try:
                 file_io = await bot.download(file_obj)
                 enc_bytes = encrypt_data(file_io.read())
