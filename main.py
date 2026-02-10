@@ -18,7 +18,6 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
-# [FIX] Updated Imports to match new config.py
 from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
@@ -39,12 +38,12 @@ user_states: Dict[int, dict] = {}
 
 async def set_bot_commands(bot: Bot):
     commands = [BotCommand(command=c, description=d) for c, d in [
-        ("start", "Start Bot"),
-        ("files", "File Manager"),
-        ("search", "Search Files"),
-        ("storage", "Check Storage"),
-        ("settings", "Settings"),
-        ("addaccount", "Add Drive")
+        ("start", "👋 Start Bot"),
+        ("files", "📂 File Manager"),
+        ("search", "🔍 Search Files"),
+        ("storage", "💾 Check Storage"),
+        ("settings", "⚙️ Settings"),
+        ("addaccount", "➕ Add Drive")
     ]]
     await bot.set_my_commands(commands)
 
@@ -146,8 +145,10 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         controls = []
         if not search_query:
             if folder_id != "root": controls.append(InlineKeyboardButton(text="🔙 Back", callback_data="go_root"))
+            # [CHANGE] Added Batch Upload Button
+            controls.append(InlineKeyboardButton(text="📚 Batch Upload", callback_data=f"batch_up:{folder_id}"))
             controls.append(InlineKeyboardButton(text="➕ New", callback_data=f"mkdir:{folder_id}"))
-            controls.append(InlineKeyboardButton(text="⬆️ Upload", callback_data=f"up:{folder_id}"))
+            controls.append(InlineKeyboardButton(text="⬆️ Up", callback_data=f"up:{folder_id}"))
             keyboard.append(controls)
         else:
             keyboard.append([InlineKeyboardButton(text="🔙 Back to Root", callback_data="go_root")])
@@ -174,9 +175,9 @@ async def render_file_info(callback: CallbackQuery, h: str):
                 f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Download", callback_data=f"down:{h}")],
-            [InlineKeyboardButton(text="Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="Delete", callback_data=f"del:{h}")],
-            [InlineKeyboardButton(text="Back", callback_data=f"open_parent:{h}")]
+            [InlineKeyboardButton(text="📥 Decrypt & Download", callback_data=f"down:{h}")],
+            [InlineKeyboardButton(text="✏️ Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="🗑 Delete", callback_data=f"del:{h}")],
+            [InlineKeyboardButton(text="🔙 Back", callback_data=f"open_parent:{h}")]
         ])
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
@@ -193,7 +194,7 @@ async def render_settings(event, user_id: int):
     text = f"⚙️ <b>Settings</b>\n\n<b>Default Account:</b>\n{escape_html(default['email'])}\n\n👇 <i>Click an account to manage:</i>"
     kb = []
     for acc in accounts:
-        is_def = "✅ " if acc.get('_id') == default.get('_id') else ""
+        is_def = "✅ " if acc.get('_id') == default.get('_id') else "Running "
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
     
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
@@ -206,7 +207,7 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     if not await db.get_user(user_id):
         await db.create_user(user_id, message.from_user.username, message.from_user.full_name)
-    await message.answer("👋 <b>Cloudyte Secure Drive</b>", parse_mode="HTML")
+    await message.answer("👋 <b>Cloudyte Secure Drive</b>\n\n/files - File Manager\n/upload - Secure Upload\n/addaccount - Link Drive", parse_mode="HTML")
 
 async def cmd_files(message: Message):
     acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or await db.accounts.find_one({"user_id": message.from_user.id})
@@ -215,7 +216,11 @@ async def cmd_files(message: Message):
 
 async def cmd_search(message: Message):
     user_states[message.from_user.id] = {"action": "search"}
-    await message.answer(" Enter the file name to search:")
+    await message.answer("🔍 Enter the file name to search:")
+
+async def cmd_upload(message: Message):
+    user_states[message.from_user.id] = {"action": "upload_file", "parent_id": "root"}
+    await message.answer("📤 Send any file (Video/Audio/Photo/Doc) now:", parse_mode="HTML")
 
 async def cmd_storage(message: Message):
     user_id = message.from_user.id
@@ -290,12 +295,11 @@ async def handle_callback(callback: CallbackQuery):
         f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
         real_name = decrypt_name(f_meta['name'])
         
-        # [CHECK] Download Limit from CONFIG
         file_size = int(f_meta.get('size', 0))
         if file_size > MAX_DOWNLOAD_SIZE:
             return await callback.answer(f"⚠️ File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
         
-        await callback.answer(" Downloading...", show_alert=False)
+        await callback.answer("⏳ Downloading...", show_alert=False)
         request = service.files().get_media(fileId=f_data['file_id'])
         file_io = io.BytesIO()
         downloader = MediaIoBaseDownload(file_io, request)
@@ -315,7 +319,27 @@ async def handle_callback(callback: CallbackQuery):
 
     elif data.startswith("up:"):
         user_states[user_id] = {"action": "upload_file", "parent_id": data.split(":")[1]}
-        await callback.message.answer("📤 Send the file now:")
+        await callback.message.answer("📤 Send file now:")
+
+    # [NEW] BATCH UPLOAD HANDLER
+    elif data.startswith("batch_up:"):
+        folder_id = data.split(":")[1]
+        user_states[user_id] = {"action": "batch_upload", "parent_id": folder_id}
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Done / Stop", callback_data=f"batch_done:{folder_id}")]])
+        await callback.message.answer("📚 <b>Batch Mode Active</b>\n\nSend unlimited files. When finished, click Done.", reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+
+    # [NEW] BATCH DONE HANDLER
+    elif data.startswith("batch_done:"):
+        folder_id = data.split(":")[1]
+        if user_id in user_states:
+            del user_states[user_id]
+        
+        # Determine account_id (User Default)
+        acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
+        if acc:
+            await callback.message.delete() # Remove the "Batch Mode Active" message
+            await render_explorer(callback.message, str(acc['_id']), folder_id)
 
     elif data.startswith("open_parent:"):
         h = data.split(":")[1]
@@ -326,7 +350,6 @@ async def handle_callback(callback: CallbackQuery):
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
         await render_explorer(callback, str(acc['_id']), "root")
     
-    # [FIX] SETTINGS CALLBACKS
     elif data.startswith("sett_acc:"):
         acc_id = data.split(":")[1]
         kb = [[InlineKeyboardButton(text="⭐ Make Default", callback_data=f"mk_def:{acc_id}")],
@@ -375,7 +398,8 @@ async def handle_user_input(message: Message):
         await message.answer(f"✅ Created"); del user_states[message.from_user.id]
         await render_explorer(message, str(acc['_id']), state['parent_id'])
 
-    elif state['action'] == "upload_file":
+    # [CHANGE] Unified Handler for Single Upload and Batch Upload
+    elif state['action'] in ["upload_file", "batch_upload"]:
         file_obj = None; filename = "untitled"
         if message.document: file_obj = message.document; filename = message.document.file_name
         elif message.video: file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"
@@ -383,23 +407,28 @@ async def handle_user_input(message: Message):
         elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
         if file_obj:
-            # [CHECK] Upload Limit from CONFIG
             if file_obj.file_size > MAX_UPLOAD_SIZE:
                 await message.answer(f"❌ File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
                 return
 
-            msg = await message.answer(f"Encrypting <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+            msg = await message.reply(f"⏳ Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             try:
                 file_io = await bot.download(file_obj)
                 enc_bytes = encrypt_data(file_io.read())
                 enc_name = encrypt_name(filename)
                 meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
-                # Force Octet-Stream
                 media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                 service.files().create(body=meta, media_body=media).execute()
+                
                 await msg.edit_text("✅ Uploaded")
-                del user_states[message.from_user.id]
-                await render_explorer(message, str(acc['_id']), state['parent_id'])
+                
+                # [LOGIC] Only clear state if it is SINGLE upload
+                if state['action'] == "upload_file":
+                    del user_states[message.from_user.id]
+                    await render_explorer(message, str(acc['_id']), state['parent_id'])
+                
+                # If Batch, we do nothing (keep state active)
+                
             except Exception as e:
                 await msg.edit_text(f"❌ Error: {e}")
 
