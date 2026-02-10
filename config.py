@@ -32,5 +32,17 @@ PORT = int(os.getenv("PORT", 3000))
 FILES_PER_PAGE = 10
 ACCOUNTS_PER_PAGE = 10
 
-# File Upload Settings
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB for Telegram file download
+# ================= LIMITS (CONTROL FROM HERE) =================
+# Note: 1 MB = 1024 * 1024 bytes
+# Note: 1 GB = 1024 * 1024 * 1024 bytes
+
+# 1. DOWNLOAD LIMIT (Drive -> Telegram)
+# Standard Bot API Limit: 50 MB
+# Local Server Limit: 2000 MB (2GB)
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 
+
+# 2. UPLOAD LIMIT (Telegram -> Drive)
+# Standard Bot API Limit: 20 MB
+
+# Local Server Limit: 2000 MB (2GB)
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024
