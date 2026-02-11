@@ -45,7 +45,6 @@ async def set_bot_commands(bot: Bot):
         ("start", "Start Bot"),
         ("files", "File Manager"),
         ("search", "Search Files"),
-        ("storage", "Check Storage"),
         ("settings", "Settings"),
         ("addaccount", "Add Drive Account"),
         ("logout", "Logout")
@@ -53,6 +52,10 @@ async def set_bot_commands(bot: Bot):
     await bot.set_my_commands(commands)
 
 # ============= HELPERS =============
+
+async def get_current_user_id(telegram_id: int) -> Optional[int]:
+    """Get internal user ID for currently logged in user"""
+    return await db.get_internal_user_id(telegram_id)
 
 def get_file_view(mime_type: str, name: str) -> str:
     if mime_type == 'application/vnd.google-apps.folder': 
@@ -197,11 +200,33 @@ async def render_settings(event, user_id: int):
     backup = await db.get_backup_account(user_id)
     backup_enabled = await db.is_backup_enabled(user_id)
     
-    text = f"<b>Settings</b>\n\n<b>Default Account:</b>\n{escape_html(default['email'])}\n\n"
+    text = f"<b>Settings</b>\n\n<b>Default Account:</b>\n{escape_html(default['email'])}\n"
+    
+    # Get storage for default account
+    try:
+        service = get_drive_service(default['access_token'], default.get('refresh_token'))
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get('storageQuota', {})
+        usage = int(quota.get('usage', 0))
+        limit = int(quota.get('limit', 0))
+        text += f"Storage: {usage/(1024**3):.2f} GB / {limit/(1024**3):.2f} GB\n\n"
+    except:
+        text += "Storage: Unable to fetch\n\n"
     
     if backup:
         backup_status = "ON" if backup_enabled else "OFF"
-        text += f"<b>Backup Account:</b> [{backup_status}]\n{escape_html(backup['email'])}\n\n"
+        text += f"<b>Backup Account:</b> [{backup_status}]\n{escape_html(backup['email'])}\n"
+        
+        # Get storage for backup account
+        try:
+            backup_service = get_drive_service(backup['access_token'], backup.get('refresh_token'))
+            backup_about = backup_service.about().get(fields="storageQuota").execute()
+            backup_quota = backup_about.get('storageQuota', {})
+            backup_usage = int(backup_quota.get('usage', 0))
+            backup_limit = int(backup_quota.get('limit', 0))
+            text += f"Storage: {backup_usage/(1024**3):.2f} GB / {backup_limit/(1024**3):.2f} GB\n\n"
+        except:
+            text += "Storage: Unable to fetch\n\n"
     else:
         text += "<b>Backup Account:</b>\nNot set\n\n"
     
@@ -236,7 +261,6 @@ async def cmd_start(message: Message):
             "/files - File Manager\n"
             "/upload - Secure Upload\n"
             "/search - Search Files\n"
-            "/storage - Check Storage\n"
             "/settings - Manage Accounts\n"
             "/addaccount - Link Drive\n"
             "/logout - Logout",
@@ -259,7 +283,11 @@ async def cmd_files(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
         return await message.answer("Please login first using /start")
     
-    acc = await db.accounts.find_one({"user_id": message.from_user.id, "is_default": True}) or await db.accounts.find_one({"user_id": message.from_user.id})
+    internal_id = await get_current_user_id(message.from_user.id)
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+    
+    acc = await db.accounts.find_one({"user_id": internal_id, "is_default": True}) or await db.accounts.find_one({"user_id": internal_id})
     if not acc: return await message.answer("No account linked. Use /addaccount")
     await render_explorer(message, str(acc['_id']), "root")
 
@@ -297,14 +325,22 @@ async def cmd_settings(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
         return await message.answer("Please login first using /start")
     
-    await render_settings(message, message.from_user.id)
+    internal_id = await get_current_user_id(message.from_user.id)
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+    
+    await render_settings(message, internal_id)
 
 async def cmd_add(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
         return await message.answer("Please login first using /start")
     
+    internal_id = await get_current_user_id(message.from_user.id)
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+    
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
-    oauth_states[state_key] = {"user_id": message.from_user.id}
+    oauth_states[state_key] = {"user_id": internal_id, "telegram_id": message.from_user.id}
     flow = Flow.from_client_config(
         {"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}},
         scopes=SCOPES, redirect_uri=REDIRECT_URI
@@ -326,11 +362,11 @@ async def cmd_logout(message: Message):
 
 async def handle_callback(callback: CallbackQuery):
     data = callback.data
-    user_id = callback.from_user.id
+    telegram_id = callback.from_user.id
 
     # === Authentication Callbacks ===
     if data == "auth_register":
-        user_states[user_id] = {"action": "register_username"}
+        user_states[telegram_id] = {"action": "register_username"}
         await callback.message.edit_text(
             "<b>Registration</b>\n\nEnter your desired username:",
             parse_mode="HTML"
@@ -339,7 +375,7 @@ async def handle_callback(callback: CallbackQuery):
         return
     
     elif data == "auth_login":
-        user_states[user_id] = {"action": "login_username"}
+        user_states[telegram_id] = {"action": "login_username"}
         await callback.message.edit_text(
             "<b>Login</b>\n\nEnter your username:",
             parse_mode="HTML"
@@ -348,7 +384,13 @@ async def handle_callback(callback: CallbackQuery):
         return
     
     # Check if user is logged in for other callbacks
-    if not await db.is_user_logged_in(user_id):
+    if not await db.is_user_logged_in(telegram_id):
+        await callback.answer("Please login first using /start", show_alert=True)
+        return
+    
+    # Get internal user ID
+    user_id = await get_current_user_id(telegram_id)
+    if not user_id:
         await callback.answer("Please login first using /start", show_alert=True)
         return
 
@@ -470,7 +512,7 @@ async def handle_callback(callback: CallbackQuery):
         await render_settings(callback, user_id)
     
     elif data == "set_backup":
-        user_states[user_id] = {"action": "set_backup_email"}
+        user_states[telegram_id] = {"action": "set_backup_email"}
         await callback.message.answer("Enter the email of the account you want to set as backup:")
         await callback.answer()
         return
@@ -486,10 +528,9 @@ async def handle_callback(callback: CallbackQuery):
 # ============= UPLOAD & INPUT =============
 
 async def handle_user_input(message: Message):
-    state = user_states.get(message.from_user.id)
+    telegram_id = message.from_user.id
+    state = user_states.get(telegram_id)
     if not state: return
-    
-    user_id = message.from_user.id
 
     # === Authentication Input Handlers ===
     if state['action'] == "register_username":
@@ -506,14 +547,14 @@ async def handle_user_input(message: Message):
             return await message.answer("Password must be at least 6 characters long.")
         
         username = state['username']
-        success = await db.register_user(
+        result = await db.register_user(
             user_id,
             username,
             password,
             message.from_user.full_name
         )
         
-        if success:
+        if result['success']:
             del user_states[user_id]
             await message.answer(
                 "<b>Registration successful!</b>\n\n"
@@ -522,7 +563,16 @@ async def handle_user_input(message: Message):
             )
         else:
             del user_states[user_id]
-            await message.answer("Registration failed. Username might be taken. Try /start again.")
+            if result['error'] == 'already_registered':
+                await message.answer(
+                    "You already have an account. Please use <b>Login</b> instead.\n\n"
+                    "Use /start to login.",
+                    parse_mode="HTML"
+                )
+            elif result['error'] == 'username_taken':
+                await message.answer("Username is already taken. Try a different username.\n\nUse /start to try again.")
+            else:
+                await message.answer("Registration failed. Try /start again.")
         return
     
     elif state['action'] == "login_username":
@@ -550,7 +600,12 @@ async def handle_user_input(message: Message):
         return
     
     # Check if user is logged in for other actions
-    if not await db.is_user_logged_in(user_id):
+    if not await db.is_user_logged_in(telegram_id):
+        return await message.answer("Please login first using /start")
+    
+    # Get internal user ID for drive operations
+    user_id = await get_current_user_id(telegram_id)
+    if not user_id:
         return await message.answer("Please login first using /start")
     
     # Handle backup account setup
@@ -563,7 +618,7 @@ async def handle_user_input(message: Message):
         if existing_acc:
             # Account found, set as backup
             await db.set_backup_account(user_id, str(existing_acc['_id']))
-            del user_states[user_id]
+            del user_states[telegram_id]
             await message.answer(
                 f"<b>Backup account set:</b>\n{escape_html(email)}\n\n"
                 "Use /settings to enable/disable backup.",
@@ -571,14 +626,14 @@ async def handle_user_input(message: Message):
             )
         else:
             # Account not found, provide auth link
-            state_key = f"{user_id}_{int(datetime.now().timestamp())}_backup"
-            oauth_states[state_key] = {"user_id": user_id, "is_backup": True}
+            state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
+            oauth_states[state_key] = {"user_id": user_id, "telegram_id": telegram_id, "is_backup": True}
             flow = Flow.from_client_config(
                 {"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}},
                 scopes=SCOPES, redirect_uri=REDIRECT_URI
             )
             auth_url, _ = flow.authorization_url(access_type='offline', state=state_key, prompt='consent')
-            del user_states[user_id]
+            del user_states[telegram_id]
             await message.answer(
                 f"Account with email <code>{escape_html(email)}</code> not found.\n\n"
                 "Click below to add this account:",
@@ -682,7 +737,6 @@ async def main():
     dp.message.register(cmd_files, Command("files"))
     dp.message.register(cmd_search, Command("search"))
     dp.message.register(cmd_upload, Command("upload"))
-    dp.message.register(cmd_storage, Command("storage"))
     dp.message.register(cmd_settings, Command("settings"))
     dp.message.register(cmd_add, Command("addaccount"))
     dp.message.register(cmd_logout, Command("logout"))
