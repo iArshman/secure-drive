@@ -205,6 +205,9 @@ async def oauth_callback_handler(request):
         if not code or not state:
             return web.Response(text="Bad Request: Missing parameters", status=400)
         
+        # Check if this is a backup account setup
+        is_backup = "_backup" in state
+        
         try:
             user_id = int(state.split('_')[0])
         except (ValueError, IndexError):
@@ -238,12 +241,20 @@ async def oauth_callback_handler(request):
             'expires_at': time.time() + tokens.get('expires_in', 3600)
         }
         
-        await db.add_account(user_id, email, tokens_data)
+        account_id = await db.add_account(user_id, email, tokens_data)
         
-        await bot.send_message(
-            user_id,
-            f"Account Connected: {email}\nSecure encryption protocols active."
-        )
+        # If backup flag is set, set as backup account
+        if is_backup:
+            await db.set_backup_account(user_id, account_id)
+            await bot.send_message(
+                user_id,
+                f"Backup Account Connected: {email}\nUse /settings to enable backup."
+            )
+        else:
+            await bot.send_message(
+                user_id,
+                f"Account Connected: {email}\nSecure encryption protocols active."
+            )
         
         html = f"""
         <!DOCTYPE html>
