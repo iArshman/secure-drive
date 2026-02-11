@@ -125,16 +125,16 @@ class Database:
     
     async def logout_user(self, telegram_id: int) -> bool:
         """Logout user"""
-        result = await self.auth_users.update_one(
-            {'telegram_id': telegram_id},
+        result = await self.auth_users.update_many(
+            {'telegram_id': telegram_id, 'is_logged_in': True},
             {'$set': {'is_logged_in': False}}
         )
         return result.modified_count > 0
     
     async def is_user_logged_in(self, telegram_id: int) -> bool:
         """Check if user is logged in"""
-        user = await self.auth_users.find_one({'telegram_id': telegram_id})
-        return user and user.get('is_logged_in', False)
+        user = await self.auth_users.find_one({'telegram_id': telegram_id, 'is_logged_in': True})
+        return user is not None
     
     async def get_auth_user(self, telegram_id: int) -> Optional[Dict]:
         """Get currently logged in authenticated user by telegram ID"""
@@ -300,4 +300,3 @@ class Database:
 
 # Global database instance
 db = Database()
- 
