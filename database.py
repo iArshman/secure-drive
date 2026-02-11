@@ -26,8 +26,8 @@ class Database:
         await self.accounts.create_index([('user_id', 1), ('email', 1)])
         await self.callback_data.create_index([('user_id', 1), ('hash', 1)], unique=True)
         await self.callback_data.create_index('created_at', expireAfterSeconds=604800)  # 7 days
-        await self.auth_users.create_index('telegram_id', unique=True)
         await self.auth_users.create_index('username', unique=True)
+        await self.auth_users.create_index([('telegram_id', 1), ('is_logged_in', 1)])
 
     # === SYSTEM SECURITY (NEW) ===
     async def get_or_create_encryption_key(self) -> bytes:
@@ -56,35 +56,44 @@ class Database:
         """Hash password using SHA256"""
         return hashlib.sha256(password.encode()).hexdigest()
     
-    async def register_user(self, telegram_id: int, username: str, password: str, full_name: str = None) -> bool:
-        """Register new user with username and password"""
-        # Check if user already exists
-        existing = await self.auth_users.find_one({'telegram_id': telegram_id})
-        if existing:
-            return False
-        
+    async def register_user(self, telegram_id: int, username: str, password: str, full_name: str = None) -> dict:
+        """Register new user with username and password. Returns dict with 'success' and 'error' keys"""
         # Check if username is taken
         username_taken = await self.auth_users.find_one({'username': username})
         if username_taken:
-            return False
+            return {'success': False, 'error': 'username_taken'}
+        
+        # Logout any currently logged in user on this telegram
+        await self.auth_users.update_many(
+            {'telegram_id': telegram_id, 'is_logged_in': True},
+            {'$set': {'is_logged_in': False}}
+        )
         
         hashed_pwd = self._hash_password(password)
+        # Generate internal user ID from username only (not telegram_id)
+        internal_id = abs(hash(username)) % (10 ** 10)
+        
         user_data = {
             'telegram_id': telegram_id,
             'username': username,
             'password': hashed_pwd,
             'full_name': full_name,
             'is_logged_in': True,
+            'internal_user_id': internal_id,
             'created_at': datetime.now(timezone.utc),
             'last_login': datetime.now(timezone.utc)
         }
         
         await self.auth_users.insert_one(user_data)
-        # Also create regular user entry
-        await self.create_user(telegram_id, username, full_name)
-        return True
+        
+        # Create internal user entry with unique ID based on username
+        existing_user = await self.users.find_one({'user_id': internal_id})
+        if not existing_user:
+            await self.create_user(internal_id, username, full_name)
+        
+        return {'success': True, 'error': None, 'internal_user_id': internal_id}
     
-    async def login_user(self, telegram_id: int, username: str, password: str) -> bool:
+    async def login_user(self, telegram_id: int, username: str, password: str) -> dict:
         """Login user with username and password"""
         hashed_pwd = self._hash_password(password)
         user = await self.auth_users.find_one({
@@ -93,6 +102,12 @@ class Database:
         })
         
         if user:
+            # Logout any other user logged in on this telegram
+            await self.auth_users.update_many(
+                {'telegram_id': telegram_id, 'is_logged_in': True},
+                {'$set': {'is_logged_in': False}}
+            )
+            
             # Update login status and last login
             await self.auth_users.update_one(
                 {'_id': user['_id']},
@@ -102,8 +117,11 @@ class Database:
                     'last_login': datetime.now(timezone.utc)
                 }}
             )
-            return True
-        return False
+            
+            # Get internal user ID from username
+            internal_id = abs(hash(username)) % (10 ** 10)
+            return {'success': True, 'internal_user_id': internal_id}
+        return {'success': False, 'internal_user_id': None}
     
     async def logout_user(self, telegram_id: int) -> bool:
         """Logout user"""
@@ -119,8 +137,15 @@ class Database:
         return user and user.get('is_logged_in', False)
     
     async def get_auth_user(self, telegram_id: int) -> Optional[Dict]:
-        """Get authenticated user by telegram ID"""
-        return await self.auth_users.find_one({'telegram_id': telegram_id})
+        """Get currently logged in authenticated user by telegram ID"""
+        return await self.auth_users.find_one({'telegram_id': telegram_id, 'is_logged_in': True})
+    
+    async def get_internal_user_id(self, telegram_id: int) -> Optional[int]:
+        """Get internal user ID for currently logged in user"""
+        auth_user = await self.get_auth_user(telegram_id)
+        if auth_user:
+            return abs(hash(auth_user['username'])) % (10 ** 10)
+        return None
     
     # User Operations
     async def get_user(self, user_id: int) -> Optional[Dict]:
