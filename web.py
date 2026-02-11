@@ -208,10 +208,16 @@ async def oauth_callback_handler(request):
         # Check if this is a backup account setup
         is_backup = "_backup" in state
         
-        try:
-            user_id = int(state.split('_')[0])
-        except (ValueError, IndexError):
-            return web.Response(text="Bad Request: Invalid state", status=400)
+        # Get stored user data from oauth_states
+        state_data = oauth_states.get(state)
+        if not state_data:
+            return web.Response(text="Invalid or expired state", status=400)
+        
+        user_id = state_data.get('user_id')  # Internal user ID
+        telegram_id = state_data.get('telegram_id')  # Telegram user ID for messages
+        
+        if not user_id or not telegram_id:
+            return web.Response(text="Bad Request: Invalid state data", status=400)
         
         # Exchange code for tokens
         token_url = "https://oauth2.googleapis.com/token"
@@ -247,12 +253,12 @@ async def oauth_callback_handler(request):
         if is_backup:
             await db.set_backup_account(user_id, account_id)
             await bot.send_message(
-                user_id,
+                telegram_id,
                 f"Backup Account Connected: {email}\nUse /settings to enable backup."
             )
         else:
             await bot.send_message(
-                user_id,
+                telegram_id,
                 f"Account Connected: {email}\nSecure encryption protocols active."
             )
         
