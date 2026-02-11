@@ -5,6 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from cryptography.fernet import Fernet
+import hashlib
 from config import MONGO_URI, DATABASE_NAME
 
 class Database:
@@ -16,7 +17,8 @@ class Database:
         self.users = self.db['users']
         self.accounts = self.db['drive_accounts']
         self.callback_data = self.db['callback_data']
-        self.system_config = self.db['system_config']  # New collection for encryption keys
+        self.system_config = self.db['system_config']
+        self.auth_users = self.db['auth_users']  # New: user authentication
     
     async def create_indexes(self):
         """Create database indexes for better performance"""
@@ -24,6 +26,8 @@ class Database:
         await self.accounts.create_index([('user_id', 1), ('email', 1)])
         await self.callback_data.create_index([('user_id', 1), ('hash', 1)], unique=True)
         await self.callback_data.create_index('created_at', expireAfterSeconds=604800)  # 7 days
+        await self.auth_users.create_index('telegram_id', unique=True)
+        await self.auth_users.create_index('username', unique=True)
 
     # === SYSTEM SECURITY (NEW) ===
     async def get_or_create_encryption_key(self) -> bytes:
@@ -46,6 +50,78 @@ class Database:
             print("🔐 New Encryption Key Generated & Saved to Database!")
             return new_key
     
+    # === Authentication Operations ===
+    
+    def _hash_password(self, password: str) -> str:
+        """Hash password using SHA256"""
+        return hashlib.sha256(password.encode()).hexdigest()
+    
+    async def register_user(self, telegram_id: int, username: str, password: str, full_name: str = None) -> bool:
+        """Register new user with username and password"""
+        # Check if user already exists
+        existing = await self.auth_users.find_one({'telegram_id': telegram_id})
+        if existing:
+            return False
+        
+        # Check if username is taken
+        username_taken = await self.auth_users.find_one({'username': username})
+        if username_taken:
+            return False
+        
+        hashed_pwd = self._hash_password(password)
+        user_data = {
+            'telegram_id': telegram_id,
+            'username': username,
+            'password': hashed_pwd,
+            'full_name': full_name,
+            'is_logged_in': True,
+            'created_at': datetime.now(timezone.utc),
+            'last_login': datetime.now(timezone.utc)
+        }
+        
+        await self.auth_users.insert_one(user_data)
+        # Also create regular user entry
+        await self.create_user(telegram_id, username, full_name)
+        return True
+    
+    async def login_user(self, telegram_id: int, username: str, password: str) -> bool:
+        """Login user with username and password"""
+        hashed_pwd = self._hash_password(password)
+        user = await self.auth_users.find_one({
+            'username': username,
+            'password': hashed_pwd
+        })
+        
+        if user:
+            # Update login status and last login
+            await self.auth_users.update_one(
+                {'_id': user['_id']},
+                {'$set': {
+                    'telegram_id': telegram_id,
+                    'is_logged_in': True,
+                    'last_login': datetime.now(timezone.utc)
+                }}
+            )
+            return True
+        return False
+    
+    async def logout_user(self, telegram_id: int) -> bool:
+        """Logout user"""
+        result = await self.auth_users.update_one(
+            {'telegram_id': telegram_id},
+            {'$set': {'is_logged_in': False}}
+        )
+        return result.modified_count > 0
+    
+    async def is_user_logged_in(self, telegram_id: int) -> bool:
+        """Check if user is logged in"""
+        user = await self.auth_users.find_one({'telegram_id': telegram_id})
+        return user and user.get('is_logged_in', False)
+    
+    async def get_auth_user(self, telegram_id: int) -> Optional[Dict]:
+        """Get authenticated user by telegram ID"""
+        return await self.auth_users.find_one({'telegram_id': telegram_id})
+    
     # User Operations
     async def get_user(self, user_id: int) -> Optional[Dict]:
         """Get user by ID"""
@@ -58,6 +134,8 @@ class Database:
             'username': username,
             'full_name': full_name,
             'default_account_id': None,
+            'backup_account_id': None,
+            'backup_enabled': False,
             'created_at': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc)
         }
@@ -158,6 +236,42 @@ class Database:
         )
         
         await self.update_user(user_id, {'default_account_id': account_id})
+    
+    # Backup Account Operations
+    async def set_backup_account(self, user_id: int, account_id: str):
+        """Set backup account for user"""
+        from bson import ObjectId
+        
+        # Remove backup from all accounts
+        await self.accounts.update_many(
+            {'user_id': user_id},
+            {'$set': {'is_backup': False}}
+        )
+        
+        # Set new backup
+        await self.accounts.update_one(
+            {'_id': ObjectId(account_id)},
+            {'$set': {'is_backup': True}}
+        )
+        
+        await self.update_user(user_id, {'backup_account_id': account_id})
+    
+    async def get_backup_account(self, user_id: int) -> Optional[Dict]:
+        """Get backup account for user"""
+        return await self.accounts.find_one({'user_id': user_id, 'is_backup': True})
+    
+    async def toggle_backup(self, user_id: int, enabled: bool):
+        """Enable or disable backup for user"""
+        await self.update_user(user_id, {'backup_enabled': enabled})
+    
+    async def is_backup_enabled(self, user_id: int) -> bool:
+        """Check if backup is enabled for user"""
+        user = await self.get_user(user_id)
+        return user and user.get('backup_enabled', False)
+    
+    async def get_account_by_email(self, user_id: int, email: str) -> Optional[Dict]:
+        """Get account by email for specific user"""
+        return await self.accounts.find_one({'user_id': user_id, 'email': email})
 
 # Global database instance
 db = Database()
