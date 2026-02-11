@@ -537,7 +537,7 @@ async def handle_user_input(message: Message):
         username = message.text.strip()
         if len(username) < 3:
             return await message.answer("Username must be at least 3 characters long.")
-        user_states[user_id] = {"action": "register_password", "username": username}
+        user_states[telegram_id] = {"action": "register_password", "username": username}
         await message.answer("Enter your password (min 6 characters):")
         return
     
@@ -548,28 +548,23 @@ async def handle_user_input(message: Message):
         
         username = state['username']
         result = await db.register_user(
-            user_id,
+            telegram_id,
             username,
             password,
             message.from_user.full_name
         )
         
         if result['success']:
-            del user_states[user_id]
+            del user_states[telegram_id]
             await message.answer(
                 "<b>Registration successful!</b>\n\n"
+                f"Account: <b>{username}</b>\n\n"
                 "You are now logged in. Use /start to see available commands.",
                 parse_mode="HTML"
             )
         else:
-            del user_states[user_id]
-            if result['error'] == 'already_registered':
-                await message.answer(
-                    "You already have an account. Please use <b>Login</b> instead.\n\n"
-                    "Use /start to login.",
-                    parse_mode="HTML"
-                )
-            elif result['error'] == 'username_taken':
+            del user_states[telegram_id]
+            if result['error'] == 'username_taken':
                 await message.answer("Username is already taken. Try a different username.\n\nUse /start to try again.")
             else:
                 await message.answer("Registration failed. Try /start again.")
@@ -577,7 +572,7 @@ async def handle_user_input(message: Message):
     
     elif state['action'] == "login_username":
         username = message.text.strip()
-        user_states[user_id] = {"action": "login_password", "username": username}
+        user_states[telegram_id] = {"action": "login_password", "username": username}
         await message.answer("Enter your password:")
         return
     
@@ -585,17 +580,18 @@ async def handle_user_input(message: Message):
         password = message.text.strip()
         username = state['username']
         
-        success = await db.login_user(user_id, username, password)
+        result = await db.login_user(telegram_id, username, password)
         
-        if success:
-            del user_states[user_id]
+        if result['success']:
+            del user_states[telegram_id]
             await message.answer(
                 "<b>Login successful!</b>\n\n"
+                f"Account: <b>{username}</b>\n\n"
                 "Use /start to see available commands.",
                 parse_mode="HTML"
             )
         else:
-            del user_states[user_id]
+            del user_states[telegram_id]
             await message.answer("Login failed. Invalid username or password. Try /start again.")
         return
     
