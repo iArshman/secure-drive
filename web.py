@@ -1,5 +1,5 @@
 """
-Web server module for Cloudyte - OAuth callbacks, Professional Home Page, and Legal Pages
+Web server module for Secure Drive - OAuth callbacks, Professional Home Page, and Legal Pages
 """
 import os
 import time
@@ -47,7 +47,7 @@ async def get_nav_html():
     return f"""
     <nav class="navbar navbar-expand-lg navbar-light sticky-top">
         <div class="container">
-            <a class="navbar-brand fw-bold text-primary" href="/">☁️ Cloudyte</a>
+            <a class="navbar-brand fw-bold text-primary" href="/">☁️ Secure Drive</a>
             <div class="ms-auto">
                 <a href="/privacy" class="btn btn-sm btn-outline-primary me-2">Privacy</a>
                 <a href="/terms" class="btn btn-sm btn-outline-primary">Terms</a>
@@ -75,7 +75,7 @@ async def get_user_email(access_token):
 # --- Route Handlers ---
 
 async def main_page_handler(request):
-    """Professional Homepage for Cloudyte Ownership Verification"""
+    """Professional Homepage for Secure Drive Ownership Verification"""
     bot_info = await bot.get_me()
     bot_link = f"https://t.me/{bot_info.username}"
     
@@ -84,7 +84,7 @@ async def main_page_handler(request):
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Cloudyte - Secure Cloud Management</title>
+        <title>Secure Drive - Secure Cloud Management</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         {COMMON_STYLE}
     </head>
@@ -92,7 +92,7 @@ async def main_page_handler(request):
         {await get_nav_html()}
         <div class="hero text-center">
             <div class="container">
-                <h1 class="display-4 fw-bold mb-3">Welcome to Cloudyte</h1>
+                <h1 class="display-4 fw-bold mb-3">Welcome to Secure Drive</h1>
                 <p class="lead mb-4">The ultimate security layer for your Google Drive via Telegram.</p>
                 <a href="{bot_link}" class="btn btn-light btn-lg px-5 fw-bold text-primary">Open @{bot_info.username}</a>
             </div>
@@ -123,7 +123,7 @@ async def main_page_handler(request):
 
         <footer class="text-center">
             <div class="container">
-                <p>© 2026 <strong>Cloudyte</strong>. Registered to <strong>arshman.me</strong>.</p>
+                <p>© 2026 <strong>Secure Drive</strong>. Registered to <strong>arshman.me</strong>.</p>
                 <div class="mb-3">
                     <a href="/privacy">Privacy Policy</a>
                     <a href="/terms">Terms of Service</a>
@@ -141,7 +141,7 @@ async def privacy_policy_handler(request):
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
-    <head><title>Privacy Policy - Cloudyte</title>{COMMON_STYLE}</head>
+    <head><title>Privacy Policy - Secure Drive</title>{COMMON_STYLE}</head>
     <body>
         {await get_nav_html()}
         <div class="container my-5">
@@ -150,7 +150,7 @@ async def privacy_policy_handler(request):
                 <p class="text-muted">Effective Date: April 13, 2026</p>
                 <hr>
                 <h5>1. Data Collection</h5>
-                <p>Cloudyte collects your email address and authentication tokens via Google OAuth to provide cloud management services.</p>
+                <p>Secure Drive collects your email address and authentication tokens via Google OAuth to provide cloud management services.</p>
                 <h5>2. Google Drive Access</h5>
                 <p>We only access your Google Drive files to perform actions you explicitly trigger via the Telegram bot (Upload, Download, Encrypt). We do not store your raw file content on our servers.</p>
                 <h5>3. Encryption & Security</h5>
@@ -169,17 +169,17 @@ async def terms_of_service_handler(request):
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
-    <head><title>Terms of Service - Cloudyte</title>{COMMON_STYLE}</head>
+    <head><title>Terms of Service - Secure Drive</title>{COMMON_STYLE}</head>
     <body>
         {await get_nav_html()}
         <div class="container my-5">
             <div class="card-custom p-5">
                 <h2 class="text-primary mb-4">Terms of Service</h2>
                 <hr>
-                <p>By using <strong>Cloudyte</strong>, you agree to the following terms:</p>
+                <p>By using <strong>Secure Drive</strong>, you agree to the following terms:</p>
                 <ul>
                     <li>You will not use the service for any illegal storage or transmission of prohibited content.</li>
-                    <li>Cloudyte is a zero-knowledge management tool; we are not responsible for lost encryption keys.</li>
+                    <li>Secure Drive is a zero-knowledge management tool; we are not responsible for lost encryption keys.</li>
                     <li>We reserve the right to suspend accounts that violate Google Drive's API policies.</li>
                 </ul>
             </div>
@@ -235,10 +235,10 @@ async def oauth_callback_handler(request):
         await db.add_account(user_id, email, tokens_data)
         
         # Notify user on Telegram
-        try: await bot.send_message(telegram_id, f"✅ <b>Cloudyte Linked:</b> {email}", parse_mode="HTML")
+        try: await bot.send_message(telegram_id, f"✅ <b>Secure Drive Linked:</b> {email}", parse_mode="HTML")
         except: pass
         
-        return web.Response(text="<html><body style='text-align:center;padding-top:100px;font-family:sans-serif;'><h1 style='color:#007bff;'>Success!</h1><p>Cloudyte is connected. Close this window and return to Telegram.</p></body></html>", content_type='text/html')
+        return web.Response(text="<html><body style='text-align:center;padding-top:100px;font-family:sans-serif;'><h1 style='color:#007bff;'>Success!</h1><p>Secure Drive is connected. Close this window and return to Telegram.</p></body></html>", content_type='text/html')
         
     except Exception as e:
         logger.error(f"OAuth callback error: {e}")
