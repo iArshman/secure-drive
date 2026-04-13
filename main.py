@@ -257,7 +257,7 @@ async def cmd_start(message: Message):
     # Check if user is logged in
     if await db.is_user_logged_in(user_id):
         await message.answer(
-            "<b>Cloudyte Secure Drive</b>\n\n"
+            "<b>Secure Drive</b>\n\n"
             "/files - File Manager\n"
             "/upload - Secure Upload\n"
             "/search - Search Files\n"
@@ -273,7 +273,7 @@ async def cmd_start(message: Message):
             [InlineKeyboardButton(text="Login", callback_data="auth_login")]
         ])
         await message.answer(
-            "<b>Welcome to Cloudyte Secure Drive</b>\n\n"
+            "<b>Welcome to Secure Drive</b>\n\n"
             "Please register or login to continue.",
             reply_markup=kb,
             parse_mode="HTML"
