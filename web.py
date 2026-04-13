@@ -1,13 +1,16 @@
 """
-Web server module for OAuth callbacks and status page
+Web server module for Cloudyte - OAuth callbacks, Professional Home Page, and Legal Pages
 """
-from aiohttp import web, ClientSession
-import logging
+import os
 import time
+import json
+import logging
+import base64
+from aiohttp import web, ClientSession
 
 logger = logging.getLogger(__name__)
 
-# Will be set by main.py
+# Global variables set by main.py
 bot = None
 db = None
 oauth_states = None
@@ -25,170 +28,160 @@ def setup_web_module(bot_instance, db_instance, oauth_states_dict, client_id, cl
     CLIENT_SECRET = client_secret
     REDIRECT_URI = redirect_uri
 
+# --- UI Helper: Common Styles ---
+COMMON_STYLE = """
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+    :root { --primary: #007bff; --bg: #f8f9fa; }
+    body { background-color: var(--bg); font-family: 'Segoe UI', Tahoma, sans-serif; color: #333; line-height: 1.6; }
+    .navbar { background: white; box-shadow: 0 2px 10px rgba(0,0,0,0.05); border-bottom: 2px solid var(--primary); }
+    .hero { background: linear-gradient(135deg, #007bff 0%, #0056b3 100%); color: white; padding: 80px 0; border-radius: 0 0 50px 50px; }
+    .card-custom { border: none; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); background: white; transition: 0.3s; }
+    .card-custom:hover { transform: translateY(-5px); }
+    footer { padding: 40px 0; background: #212529; color: #aaa; margin-top: 50px; }
+    footer a { color: white; text-decoration: none; margin: 0 10px; }
+</style>
+"""
+
+async def get_nav_html():
+    return f"""
+    <nav class="navbar navbar-expand-lg navbar-light sticky-top">
+        <div class="container">
+            <a class="navbar-brand fw-bold text-primary" href="/">☁️ Cloudyte</a>
+            <div class="ms-auto">
+                <a href="/privacy" class="btn btn-sm btn-outline-primary me-2">Privacy</a>
+                <a href="/terms" class="btn btn-sm btn-outline-primary">Terms</a>
+            </div>
+        </div>
+    </nav>
+    """
+
+# --- Google API Helpers ---
 async def get_user_email(access_token):
-    """Get user email from Google Drive API"""
+    """Get user email using the OAuth2 UserInfo endpoint (Most reliable)"""
     try:
         headers = {'Authorization': f'Bearer {access_token}'}
         async with ClientSession() as session:
-            async with session.get('https://www.googleapis.com/drive/v3/about?fields=user', headers=headers) as response:
+            async with session.get('https://www.googleapis.com/oauth2/v3/userinfo', headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get('user', {}).get('emailAddress')
+                    return data.get('email')
                 else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to get user info. Status: {response.status}, Response: {error_text}")
+                    logger.error(f"UserInfo Error: {await response.text()}")
     except Exception as e:
-        logger.error(f"Error getting user email: {e}")
+        logger.error(f"Error fetching user email: {e}")
     return None
 
+# --- Route Handlers ---
+
 async def main_page_handler(request):
-    """Handle main page requests"""
-    bot_username = (await bot.get_me()).username if bot else "YOUR_BOT_USERNAME"
+    """Professional Homepage for Cloudyte Ownership Verification"""
+    bot_info = await bot.get_me()
+    bot_link = f"https://t.me/{bot_info.username}"
     
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Secure Drive Service</title>
+        <title>Cloudyte - Secure Cloud Management</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            :root {{
-                --primary-color: #0056b3;
-                --text-color: #24292e;
-                --bg-color: #f6f8fa;
-                --card-bg: #ffffff;
-                --border-color: #d1d5da;
-                --secondary-text: #586069;
-            }}
-            body {{ 
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                background-color: var(--bg-color);
-                color: var(--text-color);
-                margin: 0;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                min-height: 100vh;
-                line-height: 1.5;
-            }}
-            .container {{ 
-                background: var(--card-bg); 
-                padding: 40px; 
-                border: 1px solid var(--border-color);
-                border-radius: 6px; 
-                width: 100%;
-                max-width: 450px;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-            }}
-            .header-bar {{
-                margin-bottom: 24px;
-                padding-bottom: 24px;
-                border-bottom: 1px solid var(--border-color);
-            }}
-            h1 {{ 
-                font-size: 20px; 
-                font-weight: 600; 
-                margin: 0;
-                color: var(--text-color);
-            }}
-            .status-indicator {{
-                display: flex;
-                align-items: center;
-                font-size: 14px;
-                color: #2da44e;
-                margin-bottom: 8px;
-            }}
-            .status-dot {{
-                width: 8px;
-                height: 8px;
-                background-color: #2da44e;
-                border-radius: 50%;
-                margin-right: 8px;
-            }}
-            p {{
-                margin-bottom: 16px;
-                color: var(--secondary-text);
-                font-size: 14px;
-            }}
-            .features-list {{
-                margin: 24px 0;
-            }}
-            .feature-row {{
-                display: flex;
-                justify-content: space-between;
-                padding: 8px 0;
-                font-size: 14px;
-                border-bottom: 1px solid #eaecef;
-            }}
-            .feature-row:last-child {{ border-bottom: none; }}
-            .feature-label {{ color: var(--secondary-text); }}
-            .feature-value {{ font-weight: 500; }}
-            
-            .btn {{
-                display: block;
-                width: 100%;
-                padding: 10px 0;
-                background-color: var(--primary-color);
-                color: white;
-                text-decoration: none;
-                border-radius: 6px;
-                font-weight: 500;
-                font-size: 14px;
-                text-align: center;
-                transition: opacity 0.2s;
-                box-sizing: border-box;
-                margin-top: 24px;
-            }}
-            .btn:hover {{ opacity: 0.9; }}
-            
-            .footer {{
-                margin-top: 24px;
-                font-size: 12px;
-                color: var(--secondary-text);
-                text-align: center;
-            }}
-            .footer a {{
-                color: var(--secondary-text);
-                text-decoration: none;
-                margin: 0 8px;
-            }}
-            .footer a:hover {{ text-decoration: underline; }}
-        </style>
+        {COMMON_STYLE}
     </head>
     <body>
-        <div class="container">
-            <div class="header-bar">
-                <div class="status-indicator">
-                    <div class="status-dot"></div>
-                    <span>System Operational</span>
-                </div>
-                <h1>Secure Drive Integration</h1>
+        {await get_nav_html()}
+        <div class="hero text-center">
+            <div class="container">
+                <h1 class="display-4 fw-bold mb-3">Welcome to Cloudyte</h1>
+                <p class="lead mb-4">The ultimate security layer for your Google Drive via Telegram.</p>
+                <a href="{bot_link}" class="btn btn-light btn-lg px-5 fw-bold text-primary">Open @{bot_info.username}</a>
             </div>
-            
-            <p>End-to-end encrypted storage management interface.</p>
-            
-            <div class="features-list">
-                <div class="feature-row">
-                    <span class="feature-label">Encryption Protocol</span>
-                    <span class="feature-value">AES-256</span>
+        </div>
+        
+        <div class="container my-5 text-center">
+            <div class="row g-4">
+                <div class="col-md-4">
+                    <div class="card-custom p-4 h-100">
+                        <h4 class="text-primary">Zero-Knowledge</h4>
+                        <p>We use AES-256 encryption to ensure only you can access your cloud files.</p>
+                    </div>
                 </div>
-                <div class="feature-row">
-                    <span class="feature-label">Architecture</span>
-                    <span class="feature-value">Zero-Knowledge</span>
+                <div class="col-md-4">
+                    <div class="card-custom p-4 h-100">
+                        <h4 class="text-primary">Secure Auth</h4>
+                        <p>Access granted via official Google OAuth 2.0. We never see your password.</p>
+                    </div>
                 </div>
-                <div class="feature-row">
-                    <span class="feature-label">Storage Provider</span>
-                    <span class="feature-value">Google Drive API</span>
+                <div class="col-md-4">
+                    <div class="card-custom p-4 h-100">
+                        <h4 class="text-primary">Instant Sync</h4>
+                        <p>Manage, upload, and encrypt files directly through your Telegram chat.</p>
+                    </div>
                 </div>
             </div>
-            
-            <a href="https://t.me/{bot_username}" class="btn">Launch Interface</a>
-            
-            <div class="footer">
-                <a href="/privacy">Privacy Policy</a>
-                <a href="/terms">Terms of Service</a>
+        </div>
+
+        <footer class="text-center">
+            <div class="container">
+                <p>© 2026 <strong>Cloudyte</strong>. Registered to <strong>arshman.me</strong>.</p>
+                <div class="mb-3">
+                    <a href="/privacy">Privacy Policy</a>
+                    <a href="/terms">Terms of Service</a>
+                </div>
+                <p class="small">Disclaimer: This app is not affiliated with Google LLC.</p>
+            </div>
+        </footer>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
+async def privacy_policy_handler(request):
+    """Professional Privacy Policy for Google Verification"""
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><title>Privacy Policy - Cloudyte</title>{COMMON_STYLE}</head>
+    <body>
+        {await get_nav_html()}
+        <div class="container my-5">
+            <div class="card-custom p-5">
+                <h2 class="text-primary mb-4">Privacy Policy</h2>
+                <p class="text-muted">Effective Date: April 13, 2026</p>
+                <hr>
+                <h5>1. Data Collection</h5>
+                <p>Cloudyte collects your email address and authentication tokens via Google OAuth to provide cloud management services.</p>
+                <h5>2. Google Drive Access</h5>
+                <p>We only access your Google Drive files to perform actions you explicitly trigger via the Telegram bot (Upload, Download, Encrypt). We do not store your raw file content on our servers.</p>
+                <h5>3. Encryption & Security</h5>
+                <p>All data transmitted is protected via TLS 1.3. Your OAuth tokens are encrypted at rest in our database (managed by arshman.me).</p>
+                <h5>4. User Control</h5>
+                <p>You can revoke access at any time through your Google Account security settings or by deleting your account from the bot.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
+async def terms_of_service_handler(request):
+    """Professional Terms of Service for Google Verification"""
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><title>Terms of Service - Cloudyte</title>{COMMON_STYLE}</head>
+    <body>
+        {await get_nav_html()}
+        <div class="container my-5">
+            <div class="card-custom p-5">
+                <h2 class="text-primary mb-4">Terms of Service</h2>
+                <hr>
+                <p>By using <strong>Cloudyte</strong>, you agree to the following terms:</p>
+                <ul>
+                    <li>You will not use the service for any illegal storage or transmission of prohibited content.</li>
+                    <li>Cloudyte is a zero-knowledge management tool; we are not responsible for lost encryption keys.</li>
+                    <li>We reserve the right to suspend accounts that violate Google Drive's API policies.</li>
+                </ul>
             </div>
         </div>
     </body>
@@ -197,29 +190,21 @@ async def main_page_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google"""
+    """Handle OAuth callback from Google with full error reporting"""
     try:
         code = request.query.get('code')
         state = request.query.get('state')
         
         if not code or not state:
-            return web.Response(text="Bad Request: Missing parameters", status=400)
+            return web.Response(text="Error: Missing code or state parameters.", status=400)
         
-        # Check if this is a backup account setup
-        is_backup = "_backup" in state
-        
-        # Get stored user data from oauth_states
         state_data = oauth_states.get(state)
         if not state_data:
-            return web.Response(text="Invalid or expired state", status=400)
+            return web.Response(text="Session Expired. Please restart connection from Telegram.", status=400)
         
-        user_id = state_data.get('user_id')  # Internal user ID
-        telegram_id = state_data.get('telegram_id')  # Telegram user ID for messages
+        user_id = state_data.get('user_id')
+        telegram_id = state_data.get('telegram_id')
         
-        if not user_id or not telegram_id:
-            return web.Response(text="Bad Request: Invalid state data", status=400)
-        
-        # Exchange code for tokens
         token_url = "https://oauth2.googleapis.com/token"
         data = {
             'code': code,
@@ -231,15 +216,15 @@ async def oauth_callback_handler(request):
         
         async with ClientSession() as session:
             async with session.post(token_url, data=data) as response:
+                resp_json = await response.json()
                 if response.status != 200:
-                    return web.Response(text="Authentication Failed. Please try again.", status=400)
-                
-                tokens = await response.json()
+                    logger.error(f"Google Token Error: {resp_json}")
+                    return web.Response(text=f"Auth Error: {resp_json.get('error_description', 'Invalid Request')}", status=400)
+                tokens = resp_json
         
-        # Get user email
         email = await get_user_email(tokens['access_token'])
         if not email:
-            return web.Response(text="Could not retrieve user profile.", status=400)
+            return web.Response(text="Failed to retrieve account email.", status=400)
         
         tokens_data = {
             'access_token': tokens['access_token'],
@@ -247,166 +232,20 @@ async def oauth_callback_handler(request):
             'expires_at': time.time() + tokens.get('expires_in', 3600)
         }
         
-        account_id = await db.add_account(user_id, email, tokens_data)
+        await db.add_account(user_id, email, tokens_data)
         
-        # If backup flag is set, set as backup account
-        if is_backup:
-            await db.set_backup_account(user_id, account_id)
-            await bot.send_message(
-                telegram_id,
-                f"Backup Account Connected: {email}\nUse /settings to enable backup."
-            )
-        else:
-            await bot.send_message(
-                telegram_id,
-                f"Account Connected: {email}\nSecure encryption protocols active."
-            )
+        # Notify user on Telegram
+        try: await bot.send_message(telegram_id, f"✅ <b>Cloudyte Linked:</b> {email}", parse_mode="HTML")
+        except: pass
         
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <title>Connection Successful</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-                body {{ 
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                    background-color: #f6f8fa;
-                    color: #24292e;
-                    margin: 0;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    min-height: 100vh;
-                }}
-                .container {{ 
-                    background: white; 
-                    padding: 40px; 
-                    border: 1px solid #d1d5da;
-                    border-radius: 6px; 
-                    width: 100%;
-                    max-width: 450px;
-                    text-align: center;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-                }}
-                h1 {{ 
-                    font-size: 20px; 
-                    color: #2da44e; 
-                    margin-bottom: 16px; 
-                    font-weight: 600;
-                }}
-                .email-box {{
-                    background: #f6f8fa;
-                    padding: 12px;
-                    border: 1px solid #eaecef;
-                    border-radius: 4px;
-                    font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
-                    font-size: 13px;
-                    margin: 24px 0;
-                    color: #24292e;
-                    word-break: break-all;
-                }}
-                p {{ color: #586069; font-size: 14px; margin: 0; }}
-                .info {{ font-size: 12px; color: #6a737d; margin-top: 32px; border-top: 1px solid #eaecef; padding-top: 16px; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Connection Established</h1>
-                <p>The following account has been successfully linked:</p>
-                <div class="email-box">{email}</div>
-                <p>You may now close this window and return to the application.</p>
-                <div class="info">Secure connection active via TLS 1.3</div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return web.Response(text=html, content_type='text/html')
+        return web.Response(text="<html><body style='text-align:center;padding-top:100px;font-family:sans-serif;'><h1 style='color:#007bff;'>Success!</h1><p>Cloudyte is connected. Close this window and return to Telegram.</p></body></html>", content_type='text/html')
         
     except Exception as e:
-        logger.error(f"OAuth callback error: {e}", exc_info=True)
+        logger.error(f"OAuth callback error: {e}")
         return web.Response(text="Internal Server Error", status=500)
 
-async def privacy_policy_handler(request):
-    """Handle privacy policy page"""
-    html = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <title>Privacy Policy</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #24292e; background-color: #ffffff; }
-            h1 { border-bottom: 1px solid #eaecef; padding-bottom: 10px; margin-bottom: 24px; font-size: 24px; font-weight: 600; }
-            h2 { margin-top: 32px; font-size: 18px; font-weight: 600; border-bottom: 1px solid #eaecef; padding-bottom: 6px; }
-            p, ul { margin-bottom: 16px; color: #444; font-size: 14px; }
-            .meta { color: #6a737d; font-size: 13px; margin-bottom: 32px; }
-            .section { margin-bottom: 24px; }
-        </style>
-    </head>
-    <body>
-        <h1>Privacy Policy</h1>
-        <div class="meta">Effective Date: February 10, 2026</div>
-        
-        <div class="section">
-            <h2>1. Data Collection</h2>
-            <p>We collect minimal data required for service operation:</p>
-            <ul>
-                <li>User Identifier (Telegram ID)</li>
-                <li>Account Identifier (Google Email)</li>
-                <li>Authentication Tokens (OAuth 2.0)</li>
-            </ul>
-        </div>
-        
-        <div class="section">
-            <h2>2. Encryption Standards</h2>
-            <p>This service employs AES-256 encryption for data at rest and TLS for data in transit. File contents and filenames are encrypted client-side before transmission to Google Drive servers.</p>
-        </div>
-        
-        <div class="section">
-            <h2>3. Data Usage</h2>
-            <p>Data is utilized strictly for authentication and file management operations requested by the user. No data is shared with third parties or used for analytics.</p>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
-async def terms_of_service_handler(request):
-    """Handle terms of service page"""
-    html = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <title>Terms of Service</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #24292e; background-color: #ffffff; }
-            h1 { border-bottom: 1px solid #eaecef; padding-bottom: 10px; margin-bottom: 24px; font-size: 24px; font-weight: 600; }
-            h2 { margin-top: 32px; font-size: 18px; font-weight: 600; }
-            p { margin-bottom: 16px; color: #444; font-size: 14px; }
-        </style>
-    </head>
-    <body>
-        <h1>Terms of Service</h1>
-        
-        <h2>1. Service Scope</h2>
-        <p>This application provides an encryption layer for cloud storage services. By using this service, you acknowledge that you maintain responsibility for your encryption keys.</p>
-        
-        <h2>2. Data Liability</h2>
-        <p>The service provider is not liable for data loss resulting from lost encryption keys, API outages, or user negligence.</p>
-        
-        <h2>3. Usage Restrictions</h2>
-        <p>Users must comply with Google Drive Terms of Service and Telegram Terms of Service. Illegal activities are strictly prohibited.</p>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
 def create_web_app():
-    """Create and configure the web application"""
+    """Build the aiohttp web application"""
     app = web.Application()
     app.router.add_get('/', main_page_handler)
     app.router.add_get('/oauth_callback', oauth_callback_handler)
