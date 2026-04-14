@@ -371,7 +371,7 @@ async def cmd_add(message: Message):
             ]
         )
     )
-
+ 
 async def cmd_logout(message: Message):
     user_id = message.from_user.id
     if await db.logout_user(user_id):
