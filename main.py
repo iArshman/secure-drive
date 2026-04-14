@@ -355,24 +355,25 @@ async def cmd_add(message: Message):
         state=state_key
     )
 
+    # ✅ store PKCE verifier instead of full flow object
     oauth_states[state_key] = {
         "user_id": message.from_user.id,
-        "flow": flow
+        "code_verifier": flow.code_verifier
     }
 
     await message.answer(
         "🔐 Link Account:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Connect Google Drive",
-                        url=auth_url
-                    )
-                ]
+                [InlineKeyboardButton(
+                    text="Connect Google Drive",
+                    url=auth_url
+                )]
             ]
         )
     )
+
+
  
 async def cmd_logout(message: Message):
     user_id = message.from_user.id
