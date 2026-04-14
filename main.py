@@ -333,14 +333,6 @@ async def cmd_settings(message: Message):
 
 async def cmd_add(message: Message):
 
-    if not await db.is_user_logged_in(message.from_user.id):
-        return await message.answer("Please login first using /start")
-
-    internal_id = await get_current_user_id(message.from_user.id)
-
-    if not internal_id:
-        return await message.answer("Please login first using /start")
-
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
 
     flow = Flow.from_client_config(
@@ -364,21 +356,18 @@ async def cmd_add(message: Message):
     )
 
     oauth_states[state_key] = {
-        "user_id": internal_id,
-        "telegram_id": message.from_user.id,
+        "user_id": message.from_user.id,
         "flow": flow
     }
 
     await message.answer(
-        "Link Account:",
+        "🔐 Link Account:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Connect Google Drive",
-                        url=auth_url
-                    )
-                ]
+                [InlineKeyboardButton(
+                    text="Connect Google Drive",
+                    url=auth_url
+                )]
             ]
         )
     )
