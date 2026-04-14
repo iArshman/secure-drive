@@ -173,11 +173,9 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        # ✅ FIX: Proper PKCE + scope-safe token exchange
-        flow.fetch_token(
-            code=code,
-            include_client_id=True
-        )
+        flow.oauth2session.scope = None
+
+flow.fetch_token(code=code)
 
         credentials = flow.credentials
 
