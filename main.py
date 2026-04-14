@@ -167,7 +167,12 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
 
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
         if isinstance(event, Message): await event.answer(text, reply_markup=markup, parse_mode="HTML")
-        else: await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            try:
+                await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    raise
 
     except Exception as e:
         logger.error(f"UI Error: {e}")
@@ -198,7 +203,11 @@ async def render_file_info(callback: CallbackQuery, h: str):
             [InlineKeyboardButton(text="Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="Delete", callback_data=f"del:{h}")],
             [InlineKeyboardButton(text="← Back", callback_data=f"open_parent:{h}")]
         ])
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        try:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
 async def render_settings(event, user_id: int):
     accounts = await db.accounts.find({"user_id": user_id}).to_list(length=10)
@@ -280,8 +289,12 @@ async def render_settings(event, user_id: int):
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
 
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    if isinstance(event, Message): await event.answer(text, reply_markup=markup, parse_mode="HTML")
-    else: await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    try:
+        if isinstance(event, Message): await event.answer(text, reply_markup=markup, parse_mode="HTML")
+        else: await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 # ============= COMMANDS =============
 
