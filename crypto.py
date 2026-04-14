@@ -12,25 +12,35 @@ def init_cipher(key: bytes):
 def _check():
     if not cipher: raise RuntimeError("Cipher not initialized")
 
-def encrypt_data(data: bytes) -> bytes:
+# --- Encryption-aware helpers ---
+# Called with an explicit `enabled` flag so each user's setting
+# is respected at the call site without any global state.
+
+def encrypt_data(data: bytes, enabled: bool = True) -> bytes:
+    if not enabled:
+        return data
     _check()
     return cipher.encrypt(data)
 
-def decrypt_data(data: bytes) -> bytes:
+def decrypt_data(data: bytes, enabled: bool = True) -> bytes:
+    if not enabled:
+        return data
     _check()
     try:
         return cipher.decrypt(data)
     except:
         return data
 
-def encrypt_name(name: str) -> str:
-    """Encrypts entire name. Google sees garbage."""
+def encrypt_name(name: str, enabled: bool = True) -> str:
+    if not enabled:
+        return name if name else "Untitled"
     _check()
     if not name: return "Untitled"
     return cipher.encrypt(name.encode()).decode()
 
-def decrypt_name(enc_name: str) -> str:
-    """Decrypts garbage back to real name."""
+def decrypt_name(enc_name: str, enabled: bool = True) -> str:
+    if not enabled:
+        return enc_name
     _check()
     try:
         return cipher.decrypt(enc_name.encode()).decode()
