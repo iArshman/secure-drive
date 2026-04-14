@@ -312,5 +312,16 @@ class Database:
         """Enable or disable encryption for user"""
         await self.update_user(user_id, {'encryption_enabled': enabled})
 
+    async def is_bot_decrypt_enabled(self, user_id: int) -> bool:
+        """Check if bot decryption is enabled for user (default: False)"""
+        user = await self.get_user(user_id)
+        if not user:
+            return False
+        return user.get('bot_decrypt_enabled', False)
+
+    async def toggle_bot_decrypt(self, user_id: int, enabled: bool):
+        """Enable or disable bot decryption for user"""
+        await self.update_user(user_id, {'bot_decrypt_enabled': enabled})
+
 # Global database instance
 db = Database()
