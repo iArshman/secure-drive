@@ -332,21 +332,59 @@ async def cmd_settings(message: Message):
     await render_settings(message, internal_id)
 
 async def cmd_add(message: Message):
+
     if not await db.is_user_logged_in(message.from_user.id):
         return await message.answer("Please login first using /start")
-    
+
     internal_id = await get_current_user_id(message.from_user.id)
+
     if not internal_id:
         return await message.answer("Please login first using /start")
-    
+
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
-    oauth_states[state_key] = {"user_id": internal_id, "telegram_id": message.from_user.id}
+
+    # Create OAuth flow FIRST
     flow = Flow.from_client_config(
-        {"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}},
-        scopes=SCOPES, redirect_uri=REDIRECT_URI
+        {
+            "web": {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+        },
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
     )
-    auth_url, _ = flow.authorization_url(access_type='offline', state=state_key, prompt='consent')
-    await message.answer("Link Account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]]))
+
+    # Generate auth URL
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=state_key
+    )
+
+    # Store flow with session state (REQUIRED for PKCE)
+    oauth_states[state_key] = {
+        "user_id": internal_id,
+        "telegram_id": message.from_user.id,
+        "flow": flow
+    }
+
+    await message.answer(
+        "Link Account:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Connect Google Drive",
+                        url=auth_url
+                    )
+                ]
+            ]
+        )
+    )
 
 async def cmd_logout(message: Message):
     user_id = message.from_user.id
