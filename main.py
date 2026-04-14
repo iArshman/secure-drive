@@ -333,6 +333,11 @@ async def cmd_settings(message: Message):
 
 async def cmd_add(message: Message):
 
+    internal_id = await get_current_user_id(message.from_user.id)
+
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
 
     flow = Flow.from_client_config(
@@ -355,9 +360,8 @@ async def cmd_add(message: Message):
         state=state_key
     )
 
-    # ✅ store PKCE verifier instead of full flow object
     oauth_states[state_key] = {
-        "user_id": message.from_user.id,
+        "user_id": internal_id, 
         "code_verifier": flow.code_verifier
     }
 
