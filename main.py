@@ -187,8 +187,13 @@ async def render_file_info(callback: CallbackQuery, h: str):
         text = (f"<b>File Details</b>\nAccount: <code>{escape_html(acc['email'])}</code>\n━━━━━━━━━━━━━━━━━━\n"
                 f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
         
+        download_row = [InlineKeyboardButton(text="⬇️ Download", callback_data=f"down:{h}")]
+        # When encryption is OFF, offer force-decrypt for files that were previously encrypted
+        if not enc_on:
+            download_row.append(InlineKeyboardButton(text="🔓 Download & Decrypt", callback_data=f"down_dec:{h}"))
+        
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Download", callback_data=f"down:{h}")],
+            download_row,
             [InlineKeyboardButton(text="Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="Delete", callback_data=f"del:{h}")],
             [InlineKeyboardButton(text="← Back", callback_data=f"open_parent:{h}")]
         ])
@@ -497,6 +502,31 @@ async def handle_callback(callback: CallbackQuery):
         while not done: _, done = downloader.next_chunk()
         file_io.seek(0)
         decrypted_bytes = decrypt_data(file_io.read(), enc_on)
+        await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
+
+    elif data.startswith("down_dec:"):
+        # Force-decrypt: always run cipher regardless of user's encryption setting
+        # Used when encryption is OFF but file was previously encrypted
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
+        # Always try to decrypt both name and content (force enc_on=True)
+        real_name = decrypt_name(f_meta['name'], enabled=True)
+        
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
+        
+        await callback.answer("Decrypting & downloading...", show_alert=False)
+        request = service.files().get_media(fileId=f_data['file_id'])
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        file_io.seek(0)
+        decrypted_bytes = decrypt_data(file_io.read(), enabled=True)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("ren:"):
