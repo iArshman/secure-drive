@@ -343,7 +343,7 @@ async def cmd_add(message: Message):
 
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
 
-    # Create OAuth flow FIRST
+    # ✅ Create OAuth Flow
     flow = Flow.from_client_config(
         {
             "web": {
@@ -357,15 +357,15 @@ async def cmd_add(message: Message):
         redirect_uri=REDIRECT_URI
     )
 
-    # Generate auth URL
+    # ✅ Generate authorization URL
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
+        include_granted_scopes=True,
         prompt="consent",
         state=state_key
     )
 
-    # Store flow with session state (REQUIRED for PKCE)
+    # ✅ IMPORTANT: store flow object
     oauth_states[state_key] = {
         "user_id": internal_id,
         "telegram_id": message.from_user.id,
@@ -385,7 +385,6 @@ async def cmd_add(message: Message):
             ]
         )
     )
-
  
 async def cmd_logout(message: Message):
     user_id = message.from_user.id
@@ -646,36 +645,73 @@ async def handle_user_input(message: Message):
     # Handle backup account setup
     if state['action'] == "set_backup_email":
         email = message.text.strip()
-        
-        # Check if account exists
-        existing_acc = await db.get_account_by_email(user_id, email)
-        
-        if existing_acc:
-            # Account found, set as backup
-            await db.set_backup_account(user_id, str(existing_acc['_id']))
-            del user_states[telegram_id]
-            await message.answer(
-                f"<b>Backup account set:</b>\n{escape_html(email)}\n\n"
-                "Use /settings to enable/disable backup.",
-                parse_mode="HTML"
-            )
-        else:
-            # Account not found, provide auth link
-            state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
-            oauth_states[state_key] = {"user_id": user_id, "telegram_id": telegram_id, "is_backup": True}
-            flow = Flow.from_client_config(
-                {"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}},
-                scopes=SCOPES, redirect_uri=REDIRECT_URI
-            )
-            auth_url, _ = flow.authorization_url(access_type='offline', state=state_key, prompt='consent')
-            del user_states[telegram_id]
-            await message.answer(
-                f"Account with email <code>{escape_html(email)}</code> not found.\n\n"
-                "Click below to add this account:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect as Backup Account", url=auth_url)]]),
-                parse_mode="HTML"
-            )
-        return
+
+    existing_acc = await db.get_account_by_email(user_id, email)
+
+    if existing_acc:
+
+        await db.set_backup_account(user_id, str(existing_acc['_id']))
+        del user_states[telegram_id]
+
+        await message.answer(
+            f"<b>Backup account set:</b>\n{escape_html(email)}\n\n"
+            "Use /settings to enable/disable backup.",
+            parse_mode="HTML"
+        )
+
+    else:
+
+        state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
+
+        # ✅ Create OAuth Flow
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token"
+                }
+            },
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI
+        )
+
+        # ✅ Generate authorization URL
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes=True,
+            prompt="consent",
+            state=state_key
+        )
+
+        # ✅ IMPORTANT FIX: store flow object
+        oauth_states[state_key] = {
+            "user_id": user_id,
+            "telegram_id": telegram_id,
+            "is_backup": True,
+            "flow": flow
+        }
+
+        del user_states[telegram_id]
+
+        await message.answer(
+            f"Account with email <code>{escape_html(email)}</code> not found.\n\n"
+            "Click below to add this account:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Connect as Backup Account",
+                            url=auth_url
+                        )
+                    ]
+                ]
+            ),
+            parse_mode="HTML"
+        )
+
+    return
 
     acc = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or await db.accounts.find_one({"user_id": user_id})
     if not acc:
