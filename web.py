@@ -145,7 +145,7 @@ async def main_page_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google (FINAL FIX)"""
+    """Handle OAuth callback from Google (FINAL WORKING VERSION)"""
 
     try:
         code = request.query.get("code")
@@ -173,9 +173,11 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
+        # ✅ Fix scope mismatch issue safely
         flow.oauth2session.scope = None
 
-flow.fetch_token(code=code)
+        # ✅ Exchange authorization code securely
+        flow.fetch_token(code=code)
 
         credentials = flow.credentials
 
@@ -185,7 +187,7 @@ flow.fetch_token(code=code)
             "expires_at": credentials.expiry.timestamp()
         }
 
-        # ✅ Drive API email fetch (kept as you want)
+        # ✅ Fetch email using Drive API
         email = await get_user_email(credentials.token)
 
         if not email:
@@ -197,10 +199,11 @@ flow.fetch_token(code=code)
 
         account_id = await db.add_account(user_id, email, tokens_data)
 
-        # Backup account handling
+        # ✅ Backup account handling
         if is_backup:
             await db.set_backup_account(user_id, account_id)
 
+        # Remove OAuth state after success
         oauth_states.pop(state, None)
 
         try:
@@ -211,7 +214,7 @@ flow.fetch_token(code=code)
         except Exception:
             pass
 
-        # ✅ KEEP YOUR UI
+        # ✅ Success UI page (unchanged)
         html = f"""
         <html>
         <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
