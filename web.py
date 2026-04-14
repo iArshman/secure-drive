@@ -145,126 +145,88 @@ async def main_page_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google (FINAL PKCE-SAFE VERSION)"""
+    """Handle OAuth callback from Google with PKCE-safe token exchange"""
 
     try:
-        import time
-        import requests
-
         code = request.query.get("code")
         state = request.query.get("state")
 
         if not code or not state:
             return web.Response(
-                text="Invalid request parameters.",
+                text="Error: Missing code or state parameters.",
                 status=400
             )
 
+        # Validate OAuth session state
         state_data = oauth_states.get(state)
 
         if not state_data:
             return web.Response(
-                text="Session expired. Please reconnect.",
+                text="Session expired. Please restart connection from Telegram.",
                 status=400
             )
 
         user_id = state_data.get("user_id")
-        telegram_id = state_data.get("telegram_id", user_id)
-        code_verifier = state_data.get("code_verifier")
-        is_backup = state_data.get("is_backup", False)
+        telegram_id = state_data.get("telegram_id")
+        flow = state_data.get("flow")
 
-        if not code_verifier:
+        if not flow:
             return web.Response(
-                text="OAuth verifier missing. Restart connection.",
+                text="OAuth flow session missing. Restart connection.",
                 status=400
             )
 
-        # 🔐 Exchange authorization code for tokens (PKCE-safe)
-        token_data = {
-            "code": code,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "grant_type": "authorization_code",
-            "code_verifier": code_verifier
-        }
+        # Exchange authorization code securely (PKCE handled automatically)
+        flow.fetch_token(code=code)
 
-        response = requests.post(
-            "https://oauth2.googleapis.com/token",
-            data=token_data
-        )
+        credentials = flow.credentials
 
-        tokens = response.json()
-
-        if "access_token" not in tokens:
-            logger.error(f"Token exchange failed: {tokens}")
-            return web.Response(
-                text="Token exchange failed.",
-                status=400
-            )
-
-        access_token = tokens["access_token"]
-        refresh_token = tokens.get("refresh_token")
-
+        # Extract tokens
         tokens_data = {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_at": time.time() + tokens.get("expires_in", 3600)
+            "access_token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "expires_at": credentials.expiry.timestamp()
         }
 
-        # 📧 Get email using Drive API
-        email = await get_user_email(access_token)
+        # Get Gmail address
+        email = await get_user_email(credentials.token)
 
         if not email:
-            logger.error("Drive API email fetch failed after token exchange")
             return web.Response(
-                text="Failed to get email address. Check bot logs.",
+                text="Failed to retrieve account email.",
                 status=400
             )
 
-        account_id = await db.add_account(
-            user_id,
-            email,
-            tokens_data
-        )
+        # Save account in database
+        await db.add_account(user_id, email, tokens_data)
 
-        # Backup account linking
-        if is_backup:
-            await db.set_backup_account(user_id, account_id)
-
-        # Remove session state after success
+        # Remove used OAuth session
         oauth_states.pop(state, None)
 
         # Notify Telegram user
         try:
             await bot.send_message(
                 telegram_id,
-                f"✅ Successfully connected {email}!"
+                f"✅ <b>Secure Drive Linked:</b> {email}",
+                parse_mode="HTML"
             )
         except Exception:
             pass
 
-        # Success UI page
-        html = f"""
-        <html>
-        <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
-            <h1 style='color:#28a745;'>Successfully Connected!</h1>
-            <p>{email}</p>
-            <p>Return to Telegram.</p>
-        </body>
-        </html>
-        """
-
         return web.Response(
-            text=html,
+            text="""
+            <html>
+            <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
+                <h1 style='color:#007bff;'>Success!</h1>
+                <p>Secure Drive is connected. Close this window and return to Telegram.</p>
+            </body>
+            </html>
+            """,
             content_type="text/html"
         )
 
     except Exception as e:
-        logger.error(
-            f"OAuth callback error: {e}",
-            exc_info=True
-        )
+        logger.error(f"OAuth callback error: {e}")
 
         return web.Response(
             text="Internal Server Error",
