@@ -58,18 +58,30 @@ async def get_nav_html():
 
 # --- Google API Helpers ---
 async def get_user_email(access_token):
-    """Get user email using the OAuth2 UserInfo endpoint (Most reliable)"""
+    """Get user email using Google OAuth UserInfo endpoint"""
+
     try:
-        headers = {'Authorization': f'Bearer {access_token}'}
+        headers = {
+            "Authorization": f"Bearer {access_token}"
+        }
+
         async with ClientSession() as session:
-            async with session.get('https://www.googleapis.com/oauth2/v3/userinfo', headers=headers) as response:
+            async with session.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers=headers
+            ) as response:
+
                 if response.status == 200:
                     data = await response.json()
-                    return data.get('email')
-                else:
-                    logger.error(f"UserInfo Error: {await response.text()}")
+                    return data.get("email")
+
+                logger.error(
+                    f"UserInfo error: {response.status} {await response.text()}"
+                )
+
     except Exception as e:
-        logger.error(f"Error fetching user email: {e}")
+        logger.error(f"Email fetch failed: {e}")
+
     return None
 
 # --- Route Handlers ---
@@ -202,7 +214,6 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        # Validate OAuth session state
         state_data = oauth_states.get(state)
 
         if not state_data:
@@ -214,6 +225,7 @@ async def oauth_callback_handler(request):
         user_id = state_data.get("user_id")
         telegram_id = state_data.get("telegram_id")
         flow = state_data.get("flow")
+        is_backup = state_data.get("is_backup", False)
 
         if not flow:
             return web.Response(
@@ -221,19 +233,18 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        # Exchange authorization code securely (PKCE handled automatically)
+        # Secure PKCE token exchange
         flow.fetch_token(code=code)
 
         credentials = flow.credentials
 
-        # Extract tokens
         tokens_data = {
             "access_token": credentials.token,
             "refresh_token": credentials.refresh_token,
             "expires_at": credentials.expiry.timestamp()
         }
 
-        # Get Gmail address
+        # Get email safely
         email = await get_user_email(credentials.token)
 
         if not email:
@@ -242,13 +253,14 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        # Save account in database
-        await db.add_account(user_id, email, tokens_data)
+        account_id = await db.add_account(user_id, email, tokens_data)
 
-        # Remove used OAuth session
+        # Handle backup-account setup automatically
+        if is_backup:
+            await db.set_backup_account(user_id, account_id)
+
         oauth_states.pop(state, None)
 
-        # Notify Telegram user
         try:
             await bot.send_message(
                 telegram_id,
@@ -263,7 +275,7 @@ async def oauth_callback_handler(request):
             <html>
             <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
                 <h1 style='color:#007bff;'>Success!</h1>
-                <p>Secure Drive is connected. Close this window and return to Telegram.</p>
+                <p>Secure Drive connected successfully. Return to Telegram.</p>
             </body>
             </html>
             """,
@@ -278,6 +290,7 @@ async def oauth_callback_handler(request):
             status=500
         )
 
+        
 def create_web_app():
     """Build the aiohttp web application"""
     app = web.Application()
