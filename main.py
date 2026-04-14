@@ -188,9 +188,10 @@ async def render_file_info(callback: CallbackQuery, h: str):
                 f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
         
         download_row = [InlineKeyboardButton(text="⬇️ Download", callback_data=f"down:{h}")]
-        # When encryption is OFF, offer force-decrypt for files that were previously encrypted
-        if not enc_on:
-            download_row.append(InlineKeyboardButton(text="🔓 Download & Decrypt", callback_data=f"down_dec:{h}"))
+        # Show Decrypt & Download only when encryption is OFF and bot decryption is ON
+        bot_decrypt_on = await db.is_bot_decrypt_enabled(acc['user_id'])
+        if not enc_on and bot_decrypt_on:
+            download_row.append(InlineKeyboardButton(text="🔓 Decrypt & Download", callback_data=f"down_dec:{h}"))
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
             download_row,
@@ -210,9 +211,19 @@ async def render_settings(event, user_id: int):
     default = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or accounts[0]
     backup = await db.get_backup_account(user_id)
     backup_enabled = await db.is_backup_enabled(user_id)
-    
-    text = f"<b>Settings</b>\n\n<b>Default Account:</b>\n{escape_html(default['email'])}\n"
-    
+    enc_enabled = await db.is_encryption_enabled(user_id)
+    bot_decrypt_enabled = await db.is_bot_decrypt_enabled(user_id)
+
+    enc_status_text = "🔒 ON" if enc_enabled else "🔓 OFF"
+    text = f"<b>⚙️ Settings</b>\n\n"
+    text += f"<b>Encryption:</b> {enc_status_text}\n"
+    if enc_enabled:
+        text += "<i>Files are encrypted on upload. Downloads are auto-decrypted.</i>\n\n"
+    else:
+        text += "<i>Files are stored as-is. Bot Decryption can decrypt previously encrypted files.</i>\n\n"
+
+    text += f"<b>Default Account:</b>\n{escape_html(default['email'])}\n"
+
     # Get storage for default account
     try:
         service = get_drive_service(default['access_token'], default.get('refresh_token'))
@@ -223,12 +234,10 @@ async def render_settings(event, user_id: int):
         text += f"Storage: {usage/(1024**3):.2f} GB / {limit/(1024**3):.2f} GB\n\n"
     except:
         text += "Storage: Unable to fetch\n\n"
-    
+
     if backup:
         backup_status = "ON" if backup_enabled else "OFF"
         text += f"<b>Backup Account:</b> [{backup_status}]\n{escape_html(backup['email'])}\n"
-        
-        # Get storage for backup account
         try:
             backup_service = get_drive_service(backup['access_token'], backup.get('refresh_token'))
             backup_about = backup_service.about().get(fields="storageQuota").execute()
@@ -240,27 +249,36 @@ async def render_settings(event, user_id: int):
             text += "Storage: Unable to fetch\n\n"
     else:
         text += "<b>Backup Account:</b>\nNot set\n\n"
-    
-    text += "<i>Click an account to manage:</i>"
-    
-    kb = []
-    for acc in accounts:
-        is_def = "[✓] " if acc.get('_id') == default.get('_id') else ""
-        kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
-    
-    # Encryption toggle
-    enc_enabled = await db.is_encryption_enabled(user_id)
-    enc_status = "🔒 Encryption: ON" if enc_enabled else "🔓 Encryption: OFF"
-    kb.append([InlineKeyboardButton(text=enc_status, callback_data="toggle_encryption")])
 
-    # Backup controls
-    backup_row = []
-    backup_row.append(InlineKeyboardButton(text="Set Backup Account", callback_data="set_backup"))
+    text += "<i>Click an account to manage:</i>"
+
+    kb = []
+
+    # --- Settings buttons FIRST (above emails) ---
+    # Encryption toggle
+    enc_btn_text = "🔒 Encryption: ON" if enc_enabled else "🔓 Encryption: OFF"
+    kb.append([InlineKeyboardButton(text=enc_btn_text, callback_data="toggle_encryption")])
+
+    # Backup controls row
+    backup_row = [InlineKeyboardButton(text="Set Backup Account", callback_data="set_backup")]
     if backup:
         toggle_text = "Disable Backup" if backup_enabled else "Enable Backup"
         backup_row.append(InlineKeyboardButton(text=toggle_text, callback_data="toggle_backup"))
     kb.append(backup_row)
-    
+
+    # Bot Decryption toggle — only shown when encryption is OFF
+    if not enc_enabled:
+        bot_dec_text = "🤖 Bot Decryption: ON" if bot_decrypt_enabled else "🤖 Bot Decryption: OFF"
+        kb.append([InlineKeyboardButton(text=bot_dec_text, callback_data="toggle_bot_decrypt")])
+
+    # Separator row (visual divider via empty label trick)
+    kb.append([InlineKeyboardButton(text="── Accounts ──", callback_data="noop")])
+
+    # --- Account emails BELOW settings buttons ---
+    for acc in accounts:
+        is_def = "[✓] " if acc.get('_id') == default.get('_id') else ""
+        kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
+
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
     if isinstance(event, Message): await event.answer(text, reply_markup=markup, parse_mode="HTML")
     else: await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -602,6 +620,7 @@ async def handle_callback(callback: CallbackQuery):
         await db.toggle_backup(user_id, not current_status)
         await callback.answer(f"Backup {'enabled' if not current_status else 'disabled'}")
         await render_settings(callback, user_id)
+        return
 
     elif data == "toggle_encryption":
         current_enc = await db.is_encryption_enabled(user_id)
@@ -609,6 +628,18 @@ async def handle_callback(callback: CallbackQuery):
         status = "enabled" if not current_enc else "disabled"
         await callback.answer(f"Encryption {status}. New files will {'be' if not current_enc else 'not be'} encrypted.")
         await render_settings(callback, user_id)
+        return
+
+    elif data == "toggle_bot_decrypt":
+        current = await db.is_bot_decrypt_enabled(user_id)
+        await db.toggle_bot_decrypt(user_id, not current)
+        await callback.answer(f"Bot Decryption {'enabled' if not current else 'disabled'}")
+        await render_settings(callback, user_id)
+        return
+
+    elif data == "noop":
+        await callback.answer()
+        return
 
     await callback.answer()
 
