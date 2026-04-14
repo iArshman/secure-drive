@@ -663,7 +663,7 @@ async def handle_user_input(message: Message):
 
         state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
 
-        # ✅ Create OAuth Flow
+        # Create OAuth Flow
         flow = Flow.from_client_config(
             {
                 "web": {
@@ -677,15 +677,15 @@ async def handle_user_input(message: Message):
             redirect_uri=REDIRECT_URI
         )
 
-        # ✅ Generate authorization URL
+        # Generate authorization URL
         auth_url, _ = flow.authorization_url(
             access_type="offline",
-            include_granted_scopes=True,
+            include_granted_scopes="true",
             prompt="consent",
             state=state_key
         )
 
-        # ✅ IMPORTANT FIX: store flow object
+        # Store flow session (IMPORTANT FIX)
         oauth_states[state_key] = {
             "user_id": user_id,
             "telegram_id": telegram_id,
