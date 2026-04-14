@@ -57,6 +57,10 @@ async def get_current_user_id(telegram_id: int) -> Optional[int]:
     """Get internal user ID for currently logged in user"""
     return await db.get_internal_user_id(telegram_id)
 
+async def enc(user_id: int) -> bool:
+    """Returns whether encryption is enabled for this user"""
+    return await db.is_encryption_enabled(user_id)
+
 def get_file_view(mime_type: str, name: str) -> str:
     if mime_type == 'application/vnd.google-apps.folder': 
         return f"📁 {name}"
@@ -109,13 +113,14 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         query = f"'{folder_id}' in parents and trashed=false"
         if search_query: query = "trashed=false" 
 
+        enc_on = await enc(account['user_id'])
         results = service.files().list(q=query, pageSize=100, pageToken=page_token, fields="files(id, name, mimeType, size), nextPageToken").execute()
         raw_files = results.get('files', [])
         next_pt = results.get('nextPageToken')
 
         processed_files = []
         for f in raw_files:
-            real_name = decrypt_name(f['name'])
+            real_name = decrypt_name(f['name'], enc_on)
             if search_query and search_query.lower() not in real_name.lower(): continue
             processed_files.append({'id': f['id'], 'name': real_name, 'mimeType': f['mimeType'], 'size': f.get('size')})
 
@@ -125,7 +130,7 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         if folder_id != "root":
             try:
                 meta = service.files().get(fileId=folder_id, fields='name').execute()
-                title = decrypt_name(meta.get('name'))
+                title = decrypt_name(meta.get('name'), enc_on)
             except: pass
         
         text = f"<b>{escape_html(title)}</b>\nAccount: <code>{escape_html(account.get('email', 'Unknown'))}</code>\n━━━━━━━━━━━━━━━━━━\n"
@@ -174,9 +179,10 @@ async def render_file_info(callback: CallbackQuery, h: str):
     f_data = await db.callback_data.find_one({"hash": h})
     if f_data:
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        enc_on = await enc(acc['user_id'])
         service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
         f = service.files().get(fileId=f_data['file_id'], fields="id, name, size, mimeType, modifiedTime").execute()
-        real_name = decrypt_name(f['name'])
+        real_name = decrypt_name(f['name'], enc_on)
         
         text = (f"<b>File Details</b>\nAccount: <code>{escape_html(acc['email'])}</code>\n━━━━━━━━━━━━━━━━━━\n"
                 f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
@@ -237,6 +243,11 @@ async def render_settings(event, user_id: int):
         is_def = "[✓] " if acc.get('_id') == default.get('_id') else ""
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
     
+    # Encryption toggle
+    enc_enabled = await db.is_encryption_enabled(user_id)
+    enc_status = "🔒 Encryption: ON" if enc_enabled else "🔓 Encryption: OFF"
+    kb.append([InlineKeyboardButton(text=enc_status, callback_data="toggle_encryption")])
+
     # Backup controls
     backup_row = []
     backup_row.append(InlineKeyboardButton(text="Set Backup Account", callback_data="set_backup"))
@@ -470,8 +481,9 @@ async def handle_callback(callback: CallbackQuery):
         f_data = await db.callback_data.find_one({"hash": h})
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
         service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        enc_on = await enc(acc['user_id'])
         f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
-        real_name = decrypt_name(f_meta['name'])
+        real_name = decrypt_name(f_meta['name'], enc_on)
         
         file_size = int(f_meta.get('size', 0))
         if file_size > MAX_DOWNLOAD_SIZE:
@@ -484,7 +496,7 @@ async def handle_callback(callback: CallbackQuery):
         done = False
         while not done: _, done = downloader.next_chunk()
         file_io.seek(0)
-        decrypted_bytes = decrypt_data(file_io.read())
+        decrypted_bytes = decrypt_data(file_io.read(), enc_on)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("ren:"):
@@ -559,6 +571,13 @@ async def handle_callback(callback: CallbackQuery):
         current_status = await db.is_backup_enabled(user_id)
         await db.toggle_backup(user_id, not current_status)
         await callback.answer(f"Backup {'enabled' if not current_status else 'disabled'}")
+        await render_settings(callback, user_id)
+
+    elif data == "toggle_encryption":
+        current_enc = await db.is_encryption_enabled(user_id)
+        await db.toggle_encryption(user_id, not current_enc)
+        status = "enabled" if not current_enc else "disabled"
+        await callback.answer(f"Encryption {status}. New files will {'be' if not current_enc else 'not be'} encrypted.")
         await render_settings(callback, user_id)
 
     await callback.answer()
@@ -723,12 +742,14 @@ async def handle_user_input(message: Message):
 
     elif state['action'] == "rename":
         f_data = await db.callback_data.find_one({"hash": state['hash']})
-        service.files().update(fileId=f_data['file_id'], body={'name': encrypt_name(message.text)}).execute()
+        enc_on = await enc(user_id)
+        service.files().update(fileId=f_data['file_id'], body={'name': encrypt_name(message.text, enc_on)}).execute()
         await message.answer("Renamed successfully"); del user_states[user_id]
         await render_explorer(message, f_data['account_id'], f_data['parent_id'])
 
     elif state['action'] == "create_folder":
-        meta = {'name': encrypt_name(message.text), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+        enc_on = await enc(user_id)
+        meta = {'name': encrypt_name(message.text, enc_on), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
         service.files().create(body=meta).execute()
         await message.answer("Folder created successfully"); del user_states[user_id]
         await render_explorer(message, str(acc['_id']), state['parent_id'])
@@ -750,8 +771,9 @@ async def handle_user_input(message: Message):
             try:
                 file_io = await bot.download(file_obj)
                 file_bytes = file_io.read()
-                enc_bytes = encrypt_data(file_bytes)
-                enc_name = encrypt_name(filename)
+                enc_on = await enc(user_id)
+                enc_bytes = encrypt_data(file_bytes, enc_on)
+                enc_name = encrypt_name(filename, enc_on)
                 meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
                 media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                 service.files().create(body=meta, media_body=media).execute()
