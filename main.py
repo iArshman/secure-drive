@@ -343,7 +343,7 @@ async def cmd_add(message: Message):
 
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
 
-    # ✅ Create OAuth Flow
+    # Create OAuth Flow
     flow = Flow.from_client_config(
         {
             "web": {
@@ -357,15 +357,15 @@ async def cmd_add(message: Message):
         redirect_uri=REDIRECT_URI
     )
 
-    # ✅ Generate authorization URL
+    # Generate authorization URL
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes=True,
+        include_granted_scopes="true",
         prompt="consent",
         state=state_key
     )
 
-    # ✅ IMPORTANT: store flow object
+    # Store flow session (IMPORTANT)
     oauth_states[state_key] = {
         "user_id": internal_id,
         "telegram_id": message.from_user.id,
