@@ -32,17 +32,20 @@ PORT = int(os.getenv("PORT", 3000))
 FILES_PER_PAGE = 10
 ACCOUNTS_PER_PAGE = 10
 
-# ================= LIMITS (CONTROL FROM HERE) =================
+# ================= LOCAL SERVER (NEW) =================
+# Define if bot should use local Telegram API server
+USE_LOCAL_SERVER = os.getenv("USE_LOCAL_SERVER", "False").lower() in ("true", "1", "yes")
+# Default local server port is usually 8081
+LOCAL_SERVER_URL = os.getenv("LOCAL_SERVER_URL", "http://localhost:8081")
+
+# ================= LIMITS =================
 # Note: 1 MB = 1024 * 1024 bytes
-# Note: 1 GB = 1024 * 1024 * 1024 bytes
 
-# 1. DOWNLOAD LIMIT (Drive -> Telegram)
-# Standard Bot API Limit: 50 MB
-# Local Server Limit: 2000 MB (2GB)
-MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 
-
-# 2. UPLOAD LIMIT (Telegram -> Drive)
-# Standard Bot API Limit: 20 MB
-
-# Local Server Limit: 2000 MB (2GB)
-MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+if USE_LOCAL_SERVER:
+    # Local Server Limits: 2000 MB (2GB)
+    MAX_DOWNLOAD_SIZE = 2000 * 1024 * 1024
+    MAX_UPLOAD_SIZE = 2000 * 1024 * 1024
+else:
+    # Standard Bot API Limits
+    MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024  # 50 MB Download
+    MAX_UPLOAD_SIZE = 20 * 1024 * 1024    # 20 MB Upload
