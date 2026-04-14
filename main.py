@@ -333,6 +333,9 @@ async def cmd_settings(message: Message):
 
 async def cmd_add(message: Message):
 
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+
     internal_id = await get_current_user_id(message.from_user.id)
 
     if not internal_id:
@@ -340,6 +343,7 @@ async def cmd_add(message: Message):
 
     state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
 
+    # Create OAuth flow FIRST
     flow = Flow.from_client_config(
         {
             "web": {
@@ -353,6 +357,7 @@ async def cmd_add(message: Message):
         redirect_uri=REDIRECT_URI
     )
 
+    # Generate auth URL
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -360,23 +365,26 @@ async def cmd_add(message: Message):
         state=state_key
     )
 
+    # Store flow with session state (REQUIRED for PKCE)
     oauth_states[state_key] = {
-        "user_id": internal_id, 
-        "code_verifier": flow.code_verifier
+        "user_id": internal_id,
+        "telegram_id": message.from_user.id,
+        "flow": flow
     }
 
     await message.answer(
-        "🔐 Link Account:",
+        "Link Account:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="Connect Google Drive",
-                    url=auth_url
-                )]
+                [
+                    InlineKeyboardButton(
+                        text="Connect Google Drive",
+                        url=auth_url
+                    )
+                ]
             ]
         )
     )
-
 
  
 async def cmd_logout(message: Message):
