@@ -348,6 +348,8 @@ async def cmd_add(message: Message):
         redirect_uri=REDIRECT_URI
     )
 
+    flow.oauth2session.scope = None
+
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -364,10 +366,12 @@ async def cmd_add(message: Message):
         "🔐 Link Account:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="Connect Google Drive",
-                    url=auth_url
-                )]
+                [
+                    InlineKeyboardButton(
+                        text="Connect Google Drive",
+                        url=auth_url
+                    )
+                ]
             ]
         )
     )
