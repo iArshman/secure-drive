@@ -11,7 +11,6 @@ from bson import ObjectId
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, BotCommand
-from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
 from google_auth_oauthlib.flow import Flow
@@ -20,7 +19,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
-from database import db
+from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 import web as web_module
 
@@ -34,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Global vars
 bot: Optional[Bot] = None
+db: Optional[Database] = None
 dp: Optional[Dispatcher] = None
 oauth_states: Dict[str, dict] = {}
 user_states: Dict[int, dict] = {}
@@ -64,6 +64,8 @@ async def enc(user_id: int) -> bool:
 def get_file_view(mime_type: str, name: str) -> str:
     if mime_type == 'application/vnd.google-apps.folder': 
         return f"📁 {name}"
+    if "." in name and not name.endswith("."):
+        return name
     return name
 
 def format_file_size(size_bytes):
@@ -186,6 +188,7 @@ async def render_file_info(callback: CallbackQuery, h: str):
                 f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
         
         download_row = [InlineKeyboardButton(text="⬇️ Download", callback_data=f"down:{h}")]
+        # Show Decrypt & Download only when encryption is OFF and bot decryption is ON
         bot_decrypt_on = await db.is_bot_decrypt_enabled(acc['user_id'])
         if not enc_on and bot_decrypt_on:
             download_row.append(InlineKeyboardButton(text="🔓 Decrypt & Download", callback_data=f"down_dec:{h}"))
@@ -214,85 +217,218 @@ async def render_settings(event, user_id: int):
     enc_status_text = "🔒 ON" if enc_enabled else "🔓 OFF"
     text = f"<b>⚙️ Settings</b>\n\n"
     text += f"<b>Encryption:</b> {enc_status_text}\n"
-    text += f"<b>Default Account:</b>\n{escape_html(default['email'])}\n\n"
+    if enc_enabled:
+        text += "<i>Files are encrypted on upload. Downloads are auto-decrypted.</i>\n\n"
+    else:
+        text += "<i>Files are stored as-is. Bot Decryption can decrypt previously encrypted files.</i>\n\n"
+
+    text += f"<b>Default Account:</b>\n{escape_html(default['email'])}\n"
+
+    # Get storage for default account
+    try:
+        service = get_drive_service(default['access_token'], default.get('refresh_token'))
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get('storageQuota', {})
+        usage = int(quota.get('usage', 0))
+        limit = int(quota.get('limit', 0))
+        text += f"Storage: {usage/(1024**3):.2f} GB / {limit/(1024**3):.2f} GB\n\n"
+    except:
+        text += "Storage: Unable to fetch\n\n"
+
+    if backup:
+        backup_status = "ON" if backup_enabled else "OFF"
+        text += f"<b>Backup Account:</b> [{backup_status}]\n{escape_html(backup['email'])}\n"
+        try:
+            backup_service = get_drive_service(backup['access_token'], backup.get('refresh_token'))
+            backup_about = backup_service.about().get(fields="storageQuota").execute()
+            backup_quota = backup_about.get('storageQuota', {})
+            backup_usage = int(backup_quota.get('usage', 0))
+            backup_limit = int(backup_quota.get('limit', 0))
+            text += f"Storage: {backup_usage/(1024**3):.2f} GB / {backup_limit/(1024**3):.2f} GB\n\n"
+        except:
+            text += "Storage: Unable to fetch\n\n"
+    else:
+        text += "<b>Backup Account:</b>\nNot set\n\n"
+
+    text += "<i>Click an account to manage:</i>"
 
     kb = []
+
+    # --- Settings buttons FIRST (above emails) ---
+    # Encryption toggle
     enc_btn_text = "🔒 Encryption: ON" if enc_enabled else "🔓 Encryption: OFF"
     kb.append([InlineKeyboardButton(text=enc_btn_text, callback_data="toggle_encryption")])
 
+    # Backup controls row
     backup_row = [InlineKeyboardButton(text="Set Backup Account", callback_data="set_backup")]
     if backup:
         toggle_text = "Disable Backup" if backup_enabled else "Enable Backup"
         backup_row.append(InlineKeyboardButton(text=toggle_text, callback_data="toggle_backup"))
     kb.append(backup_row)
 
+    # Bot Decryption toggle — only shown when encryption is OFF
     if not enc_enabled:
         bot_dec_text = "🤖 Bot Decryption: ON" if bot_decrypt_enabled else "🤖 Bot Decryption: OFF"
         kb.append([InlineKeyboardButton(text=bot_dec_text, callback_data="toggle_bot_decrypt")])
 
+    # Separator row (visual divider via empty label trick)
     kb.append([InlineKeyboardButton(text="── Accounts ──", callback_data="noop")])
+
+    # --- Account emails BELOW settings buttons ---
     for acc in accounts:
         is_def = "[✓] " if acc.get('_id') == default.get('_id') else ""
         kb.append([InlineKeyboardButton(text=f"{is_def}{acc['email']}", callback_data=f"sett_acc:{acc['_id']}")])
 
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    
-    try:
-        if isinstance(event, Message): 
-            await event.answer(text, reply_markup=markup, parse_mode="HTML")
-        else: 
-            await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            pass 
-        else:
-            logger.error(f"UI Refresh error: {e}")
+    if isinstance(event, Message): await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else: await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
 
 # ============= COMMANDS =============
 
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    
+    # Check if user is logged in
     if await db.is_user_logged_in(user_id):
         await message.answer(
-            "<b>Secure Drive</b>\n\n/files - File Manager\n/settings - Settings\n/logout - Logout",
+            "<b>Secure Drive</b>\n\n"
+            "/files - File Manager\n"
+            "/upload - Secure Upload\n"
+            "/search - Search Files\n"
+            "/settings - Manage Accounts\n"
+            "/addaccount - Link Drive\n"
+            "/logout - Logout",
             parse_mode="HTML"
         )
     else:
+        # User not logged in - show register/login options
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Register", callback_data="auth_register")],
             [InlineKeyboardButton(text="Login", callback_data="auth_login")]
         ])
-        await message.answer("<b>Welcome</b>\nPlease login to continue.", reply_markup=kb, parse_mode="HTML")
+        await message.answer(
+            "<b>Welcome to Secure Drive</b>\n\n"
+            "Please register or login to continue.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
 
 async def cmd_files(message: Message):
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+    
     internal_id = await get_current_user_id(message.from_user.id)
-    if not internal_id: return await message.answer("Login required.")
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+    
     acc = await db.accounts.find_one({"user_id": internal_id, "is_default": True}) or await db.accounts.find_one({"user_id": internal_id})
-    if not acc: return await message.answer("No account connected.")
+    if not acc: return await message.answer("No account linked. Use /addaccount")
     await render_explorer(message, str(acc['_id']), "root")
 
+async def cmd_search(message: Message):
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+    
+    user_states[message.from_user.id] = {"action": "search"}
+    await message.answer("Enter the file name to search:")
+
+async def cmd_upload(message: Message):
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+    
+    user_states[message.from_user.id] = {"action": "upload_file", "parent_id": "root"}
+    await message.answer("Send any file (Video/Audio/Photo/Doc) now:", parse_mode="HTML")
+
+async def cmd_storage(message: Message):
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+    
+    user_id = message.from_user.id
+    acc = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or await db.accounts.find_one({"user_id": user_id})
+    if not acc: return await message.answer("No account connected.")
+    try:
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get('storageQuota', {})
+        usage = int(quota.get('usage', 0)); limit = int(quota.get('limit', 0))
+        await message.answer(f"<b>Storage:</b> {usage/(1024**3):.2f} GB / {limit/(1024**3):.2f} GB", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"Error: {str(e)}")
+
 async def cmd_settings(message: Message):
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+    
     internal_id = await get_current_user_id(message.from_user.id)
-    if not internal_id: return await message.answer("Login required.")
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+    
     await render_settings(message, internal_id)
 
 async def cmd_add(message: Message):
-    internal_id = await get_current_user_id(message.from_user.id)
-    if not internal_id: return await message.answer("Login required.")
-    
-    state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
-    flow = Flow.from_client_config(
-        {"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}},
-        scopes=SCOPES, redirect_uri=REDIRECT_URI
-    )
-    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent", state=state_key)
-    oauth_states[state_key] = {"user_id": internal_id, "telegram_id": message.from_user.id, "flow": flow}
-    await message.answer("Link Account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]]))
 
+    if not await db.is_user_logged_in(message.from_user.id):
+        return await message.answer("Please login first using /start")
+
+    internal_id = await get_current_user_id(message.from_user.id)
+
+    if not internal_id:
+        return await message.answer("Please login first using /start")
+
+    state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
+
+    # Create OAuth Flow
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+        },
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+
+    # Generate authorization URL
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=state_key
+    )
+
+    # Store flow session (IMPORTANT)
+    oauth_states[state_key] = {
+        "user_id": internal_id,
+        "telegram_id": message.from_user.id,
+        "flow": flow
+    }
+
+    await message.answer(
+        "Link Account:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Connect Google Drive",
+                        url=auth_url
+                    )
+                ]
+            ]
+        )
+    )
+ 
 async def cmd_logout(message: Message):
-    if await db.logout_user(message.from_user.id):
-        await message.answer("Logged out.")
-    else: await message.answer("Error logging out.")
+    user_id = message.from_user.id
+    if await db.logout_user(user_id):
+        # Clear user state
+        if user_id in user_states:
+            del user_states[user_id]
+        await message.answer("<b>Logged out successfully.</b>\n\nUse /start to login again.", parse_mode="HTML")
+    else:
+        await message.answer("You are not logged in.")
 
 # ============= CALLBACKS =============
 
@@ -300,139 +436,462 @@ async def handle_callback(callback: CallbackQuery):
     data = callback.data
     telegram_id = callback.from_user.id
 
+    # === Authentication Callbacks ===
     if data == "auth_register":
         user_states[telegram_id] = {"action": "register_username"}
-        await callback.message.edit_text("Enter Username:")
+        await callback.message.edit_text(
+            "<b>Registration</b>\n\nEnter your desired username:",
+            parse_mode="HTML"
+        )
+        await callback.answer()
         return
+    
     elif data == "auth_login":
         user_states[telegram_id] = {"action": "login_username"}
-        await callback.message.edit_text("Enter Username:")
+        await callback.message.edit_text(
+            "<b>Login</b>\n\nEnter your username:",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+    
+    # Check if user is logged in for other callbacks
+    if not await db.is_user_logged_in(telegram_id):
+        await callback.answer("Please login first using /start", show_alert=True)
+        return
+    
+    # Get internal user ID
+    user_id = await get_current_user_id(telegram_id)
+    if not user_id:
+        await callback.answer("Please login first using /start", show_alert=True)
         return
 
-    user_id = await get_current_user_id(telegram_id)
-    if not user_id: return await callback.answer("Please login.", show_alert=True)
-
-    if data == "toggle_encryption":
-        curr = await db.is_encryption_enabled(user_id)
-        await db.toggle_encryption(user_id, not curr)
-        await callback.answer(f"Encryption {'Disabled' if curr else 'Enabled'}")
-        await render_settings(callback, user_id)
-
-    elif data == "toggle_backup":
-        curr = await db.is_backup_enabled(user_id)
-        await db.toggle_backup(user_id, not curr)
-        await callback.answer(f"Backup {'Disabled' if curr else 'Enabled'}")
-        await render_settings(callback, user_id)
-
-    elif data == "toggle_bot_decrypt":
-        curr = await db.is_bot_decrypt_enabled(user_id)
-        await db.toggle_bot_decrypt(user_id, not curr)
-        await callback.answer(f"Bot Decryption {'Disabled' if curr else 'Enabled'}")
-        await render_settings(callback, user_id)
-
-    elif data.startswith("open:"):
-        f_data = await db.callback_data.find_one({"hash": data.split(":")[1]})
+    if data.startswith("open:"):
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
         if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'])
+
+    elif data.startswith("page:"):
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'], f_data['next_token'])
 
     elif data.startswith("info:"):
         await render_file_info(callback, data.split(":")[1])
 
-    elif data == "go_root":
-        acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
-        await render_explorer(callback, str(acc['_id']), "root")
-    
-    elif data.startswith("mk_def:"):
-        await db.set_default_account(user_id, data.split(":")[1])
-        await callback.answer("Updated default account.")
-        await render_settings(callback, user_id)
+    elif data.startswith("del:"):
+        h = data.split(":")[1]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes", callback_data=f"del_yes:{h}"), InlineKeyboardButton(text="No", callback_data=f"del_no:{h}")]])
+        await callback.message.edit_text("Delete this file?", reply_markup=kb, parse_mode="HTML")
+
+    elif data.startswith("del_yes:"):
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        try:
+            get_drive_service(acc['access_token'], acc.get('refresh_token')).files().delete(fileId=f_data['file_id']).execute()
+            await callback.answer("Deleted successfully")
+            await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
+        except Exception as e:
+            await callback.answer(f"Failed: {e}", show_alert=True)
+
+    elif data.startswith("del_no:"):
+        h = data.split(":")[1]
+        await render_file_info(callback, h)
+
+    elif data.startswith("down:"):
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        enc_on = await enc(acc['user_id'])
+        f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
+        real_name = decrypt_name(f_meta['name'], enc_on)
+        
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
+        
+        await callback.answer("Downloading...", show_alert=False)
+        request = service.files().get_media(fileId=f_data['file_id'])
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        file_io.seek(0)
+        decrypted_bytes = decrypt_data(file_io.read(), enc_on)
+        await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
+
+    elif data.startswith("down_dec:"):
+        # Force-decrypt: always run cipher regardless of user's encryption setting
+        # Used when encryption is OFF but file was previously encrypted
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
+        # Always try to decrypt both name and content (force enc_on=True)
+        real_name = decrypt_name(f_meta['name'], enabled=True)
+        
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
+        
+        await callback.answer("Decrypting & downloading...", show_alert=False)
+        request = service.files().get_media(fileId=f_data['file_id'])
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        file_io.seek(0)
+        decrypted_bytes = decrypt_data(file_io.read(), enabled=True)
+        await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
+
+    elif data.startswith("ren:"):
+        user_states[user_id] = {"action": "rename", "hash": data.split(":")[1]}
+        await callback.message.answer("Enter new name:")
+
+    elif data.startswith("mkdir:"):
+        user_states[user_id] = {"action": "create_folder", "parent_id": data.split(":")[1]}
+        await callback.message.answer("Enter Folder Name:")
 
     elif data.startswith("up:"):
         user_states[user_id] = {"action": "upload_file", "parent_id": data.split(":")[1]}
         await callback.message.answer("Send file now:")
 
+    # Batch Upload Handler
     elif data.startswith("batch_up:"):
         folder_id = data.split(":")[1]
         user_states[user_id] = {"action": "batch_upload", "parent_id": folder_id}
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Done", callback_data=f"batch_done:{folder_id}")]])
-        await callback.message.answer("<b>Batch Mode Active</b>\nSend files. Click Done when finished.", reply_markup=kb, parse_mode="HTML")
+        await callback.message.answer("<b>Batch Mode Active</b>\n\nSend unlimited files. When finished, click Done.", reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
 
+    # [NEW] BATCH DONE HANDLER
     elif data.startswith("batch_done:"):
-        if user_id in user_states: del user_states[user_id]
+        folder_id = data.split(":")[1]
+        if user_id in user_states:
+            del user_states[user_id]
+        
+        # Determine account_id (User Default)
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
-        await callback.message.delete()
-        await render_explorer(callback.message, str(acc['_id']), data.split(":")[1])
+        if acc:
+            await callback.message.delete() # Remove the "Batch Mode Active" message
+            await render_explorer(callback.message, str(acc['_id']), folder_id)
+
+    elif data.startswith("open_parent:"):
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
+
+    elif data == "go_root":
+        acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
+        await render_explorer(callback, str(acc['_id']), "root")
+    
+    elif data.startswith("sett_acc:"):
+        acc_id = data.split(":")[1]
+        kb = [[InlineKeyboardButton(text="Make Default", callback_data=f"mk_def:{acc_id}")],
+              [InlineKeyboardButton(text="Delete", callback_data=f"rm_acc:{acc_id}")],
+              [InlineKeyboardButton(text="← Back", callback_data="back_set")]]
+        await callback.message.edit_text("Manage Account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+    elif data.startswith("mk_def:"):
+        await db.accounts.update_many({"user_id": user_id}, {"$set": {"is_default": False}})
+        await db.accounts.update_one({"_id": ObjectId(data.split(":")[1])}, {"$set": {"is_default": True}})
+        await callback.answer("Updated successfully")
+        await render_settings(callback, user_id)
+
+    elif data.startswith("rm_acc:"):
+        await db.accounts.delete_one({"_id": ObjectId(data.split(":")[1])})
+        await callback.answer("Removed successfully")
+        await render_settings(callback, user_id)
+    
+    elif data == "back_set":
+        await render_settings(callback, user_id)
+    
+    elif data == "set_backup":
+        user_states[telegram_id] = {"action": "set_backup_email"}
+        await callback.message.answer("Enter the email of the account you want to set as backup:")
+        await callback.answer()
+        return
+    
+    elif data == "toggle_backup":
+        current_status = await db.is_backup_enabled(user_id)
+        await db.toggle_backup(user_id, not current_status)
+        await callback.answer(f"Backup {'enabled' if not current_status else 'disabled'}")
+        await render_settings(callback, user_id)
+        return
+
+    elif data == "toggle_encryption":
+        current_enc = await db.is_encryption_enabled(user_id)
+        await db.toggle_encryption(user_id, not current_enc)
+        status = "enabled" if not current_enc else "disabled"
+        await callback.answer(f"Encryption {status}. New files will {'be' if not current_enc else 'not be'} encrypted.")
+        await render_settings(callback, user_id)
+        return
+
+    elif data == "toggle_bot_decrypt":
+        current = await db.is_bot_decrypt_enabled(user_id)
+        await db.toggle_bot_decrypt(user_id, not current)
+        await callback.answer(f"Bot Decryption {'enabled' if not current else 'disabled'}")
+        await render_settings(callback, user_id)
+        return
+
+    elif data == "noop":
+        await callback.answer()
+        return
 
     await callback.answer()
 
-# ============= INPUT HANDLING =============
+# ============= UPLOAD & INPUT =============
 
 async def handle_user_input(message: Message):
     telegram_id = message.from_user.id
     state = user_states.get(telegram_id)
     if not state: return
 
+    # === Authentication Input Handlers ===
     if state['action'] == "register_username":
-        user_states[telegram_id] = {"action": "register_password", "username": message.text.strip()}
-        await message.answer("Enter Password:")
+        username = message.text.strip()
+        if len(username) < 3:
+            return await message.answer("Username must be at least 3 characters long.")
+        user_states[telegram_id] = {"action": "register_password", "username": username}
+        await message.answer("Enter your password (min 6 characters):")
+        return
+    
     elif state['action'] == "register_password":
-        res = await db.register_user(telegram_id, state['username'], message.text.strip(), message.from_user.full_name)
-        if res['success']: await message.answer("Registered!")
-        else: await message.answer(f"Error: {res['error']}")
-        del user_states[telegram_id]
+        password = message.text.strip()
+        if len(password) < 6:
+            return await message.answer("Password must be at least 6 characters long.")
+        
+        username = state['username']
+        result = await db.register_user(
+            telegram_id,
+            username,
+            password,
+            message.from_user.full_name
+        )
+        
+        if result['success']:
+            del user_states[telegram_id]
+            await message.answer(
+                "<b>Registration successful!</b>\n\n"
+                f"Account: <b>{username}</b>\n\n"
+                "You are now logged in. Use /start to see available commands.",
+                parse_mode="HTML"
+            )
+        else:
+            del user_states[telegram_id]
+            if result['error'] == 'username_taken':
+                await message.answer("Username is already taken. Try a different username.\n\nUse /start to try again.")
+            else:
+                await message.answer("Registration failed. Try /start again.")
+        return
+    
     elif state['action'] == "login_username":
-        user_states[telegram_id] = {"action": "login_password", "username": message.text.strip()}
-        await message.answer("Enter Password:")
+        username = message.text.strip()
+        user_states[telegram_id] = {"action": "login_password", "username": username}
+        await message.answer("Enter your password:")
+        return
+    
     elif state['action'] == "login_password":
-        res = await db.login_user(telegram_id, state['username'], message.text.strip())
-        if res['success']: await message.answer("Logged in!")
-        else: await message.answer("Invalid credentials.")
-        del user_states[telegram_id]
+        password = message.text.strip()
+        username = state['username']
+        
+        result = await db.login_user(telegram_id, username, password)
+        
+        if result['success']:
+            del user_states[telegram_id]
+            await message.answer(
+                "<b>Login successful!</b>\n\n"
+                f"Account: <b>{username}</b>\n\n"
+                "Use /start to see available commands.",
+                parse_mode="HTML"
+            )
+        else:
+            del user_states[telegram_id]
+            await message.answer("Login failed. Invalid username or password. Try /start again.")
+        return
+    
+    # Check if user is logged in for other actions
+    if not await db.is_user_logged_in(telegram_id):
+        return await message.answer("Please login first using /start")
+    
+    # Get internal user ID for drive operations
+    user_id = await get_current_user_id(telegram_id)
+    if not user_id:
+        return await message.answer("Please login first using /start")
+    
+    # Handle backup account setup
+    if state['action'] == "set_backup_email":
+        email = message.text.strip()
 
-    # File Upload Handling (Single and Batch)
+        existing_acc = await db.get_account_by_email(user_id, email)
+
+        if existing_acc:
+            await db.set_backup_account(user_id, str(existing_acc['_id']))
+            del user_states[telegram_id]
+
+            await message.answer(
+                f"<b>Backup account set:</b>\n{escape_html(email)}\n\n"
+                "Use /settings to enable/disable backup.",
+                parse_mode="HTML"
+            )
+
+        else:
+            state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
+
+            # Create OAuth Flow
+            flow = Flow.from_client_config(
+                {
+                    "web": {
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                        "token_uri": "https://oauth2.googleapis.com/token"
+                    }
+                },
+                scopes=SCOPES,
+                redirect_uri=REDIRECT_URI
+            )
+
+            # Generate authorization URL
+            auth_url, _ = flow.authorization_url(
+                access_type="offline",
+                include_granted_scopes="true",
+                prompt="consent",
+                state=state_key
+            )
+
+            # Store flow session with is_backup flag
+            oauth_states[state_key] = {
+                "user_id": user_id,
+                "telegram_id": telegram_id,
+                "is_backup": True,
+                "flow": flow
+            }
+
+            del user_states[telegram_id]
+
+            await message.answer(
+                f"Account with email <code>{escape_html(email)}</code> not found.\n\n"
+                "Click below to add this account:",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Connect as Backup Account",
+                                url=auth_url
+                            )
+                        ]
+                    ]
+                ),
+                parse_mode="HTML"
+            )
+
+        return
+
+    acc = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or await db.accounts.find_one({"user_id": user_id})
+    if not acc:
+        return await message.answer("No account linked. Use /addaccount")
+    
+    service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+
+    if state['action'] == "search":
+        del user_states[message.from_user.id]
+        await render_explorer(message, str(acc['_id']), "root", search_query=message.text)
+
+    elif state['action'] == "rename":
+        f_data = await db.callback_data.find_one({"hash": state['hash']})
+        enc_on = await enc(user_id)
+        service.files().update(fileId=f_data['file_id'], body={'name': encrypt_name(message.text, enc_on)}).execute()
+        await message.answer("Renamed successfully"); del user_states[user_id]
+        await render_explorer(message, f_data['account_id'], f_data['parent_id'])
+
+    elif state['action'] == "create_folder":
+        enc_on = await enc(user_id)
+        meta = {'name': encrypt_name(message.text, enc_on), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+        service.files().create(body=meta).execute()
+        await message.answer("Folder created successfully"); del user_states[user_id]
+        await render_explorer(message, str(acc['_id']), state['parent_id'])
+
+    # [CHANGE] Unified Handler for Single Upload and Batch Upload
     elif state['action'] in ["upload_file", "batch_upload"]:
-        user_id = await get_current_user_id(telegram_id)
-        acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
-        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
-        
-        file_obj = message.document or message.video or message.audio or message.photo[-1]
-        filename = getattr(file_obj, 'file_name', 'file')
-        
-        msg = await message.reply("Uploading...")
-        try:
-            file_io = await bot.download(file_obj)
-            file_bytes = file_io.read()
-            enc_on = await enc(user_id)
-            enc_bytes = encrypt_data(file_bytes, enc_on)
-            enc_name = encrypt_name(filename, enc_on)
-            
-            meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
-            media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
-            service.files().create(body=meta, media_body=media).execute()
-            
-            await msg.edit_text("Uploaded successfully.")
-            if state['action'] == "upload_file":
-                del user_states[telegram_id]
-                await render_explorer(message, str(acc['_id']), state['parent_id'])
-        except Exception as e:
-            await msg.edit_text(f"Upload failed: {e}")
+        file_obj = None; filename = "untitled"
+        if message.document: file_obj = message.document; filename = message.document.file_name
+        elif message.video: file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"
+        elif message.audio: file_obj = message.audio; filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
+        elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
+
+        if file_obj:
+            if file_obj.file_size > MAX_UPLOAD_SIZE:
+                await message.answer(f"File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
+                return
+
+            msg = await message.reply(f"Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+            try:
+                file_io = await bot.download(file_obj)
+                file_bytes = file_io.read()
+                enc_on = await enc(user_id)
+                enc_bytes = encrypt_data(file_bytes, enc_on)
+                enc_name = encrypt_name(filename, enc_on)
+                meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+                media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                service.files().create(body=meta, media_body=media).execute()
+                
+                # Check if backup is enabled and upload to backup account
+                if await db.is_backup_enabled(user_id):
+                    backup_acc = await db.get_backup_account(user_id)
+                    if backup_acc:
+                        try:
+                            backup_service = get_drive_service(backup_acc['access_token'], backup_acc.get('refresh_token'))
+                            backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                            backup_service.files().create(body=meta, media_body=backup_media).execute()
+                            await msg.edit_text("Uploaded successfully (+ backup copy)")
+                        except Exception as backup_error:
+                            logger.error(f"Backup upload failed: {backup_error}")
+                            await msg.edit_text("Uploaded successfully (backup failed)")
+                    else:
+                        await msg.edit_text("Uploaded successfully")
+                else:
+                    await msg.edit_text("Uploaded successfully")
+                
+                # Only clear state if it is SINGLE upload
+                if state['action'] == "upload_file":
+                    del user_states[user_id]
+                    await render_explorer(message, str(acc['_id']), state['parent_id'])
+                
+                # If Batch, keep state active
+                
+            except Exception as e:
+                await msg.edit_text(f"Error: {e}")
 
 # ============= MAIN =============
 
 async def main():
-    global bot, dp
+    global bot, db, dp
     bot = Bot(token=BOT_TOKEN)
+    db = Database()
     dp = Dispatcher()
     
-    key = await db.get_or_create_encryption_key()
-    init_cipher(key)
+    try:
+        key = await db.get_or_create_encryption_key()
+        init_cipher(key)
+        logger.info("Cipher initialized successfully")
+    except Exception as e:
+        logger.error(f"Encryption key error: {e}")
+        return
 
     await set_bot_commands(bot)
-    
+    logger.info("Bot commands registered")
+
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_files, Command("files"))
+    dp.message.register(cmd_search, Command("search"))
+    dp.message.register(cmd_upload, Command("upload"))
     dp.message.register(cmd_settings, Command("settings"))
-    dp.message.register(cmd_logout, Command("logout"))
     dp.message.register(cmd_add, Command("addaccount"))
+    dp.message.register(cmd_logout, Command("logout"))
     
     dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
@@ -442,7 +901,9 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    logger.info(f"Web server started on port {PORT}")
     
+    logger.info("Bot is running...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
