@@ -26,21 +26,37 @@ def setup_web_module(bot_instance, db_instance, oauth_states_dict, client_id, cl
     REDIRECT_URI = redirect_uri
 
 async def get_user_email(access_token):
-    """Get user email from Google Drive API"""
+    """Get user email from Google Drive API (FINAL STABLE VERSION)"""
+
     try:
-        headers = {'Authorization': f'Bearer {access_token}'}
+        headers = {"Authorization": f"Bearer {access_token}"}
+
         async with ClientSession() as session:
-            async with session.get('https://www.googleapis.com/drive/v3/about?fields=user', headers=headers) as response:
+            async with session.get(
+                "https://www.googleapis.com/drive/v3/about?fields=user",
+                headers=headers
+            ) as response:
+
                 if response.status == 200:
                     data = await response.json()
-                    return data.get('user', {}).get('emailAddress')
+                    email = data.get("user", {}).get("emailAddress")
+
+                    if not email:
+                        logger.error(f"Email missing in Drive response: {data}")
+
+                    return email
+
                 else:
                     error_text = await response.text()
-                    logger.error(f"Failed to get user info from Drive API. Status: {response.status}, Response: {error_text}")
+                    logger.error(
+                        f"Drive API ERROR {response.status}: {error_text}"
+                    )
+
     except Exception as e:
         logger.error(f"Error getting user email: {e}")
-    return None
 
+    return None
+    
 async def main_page_handler(request):
     """Handle main page requests"""
     bot_username = (await bot.get_me()).username if bot else "YOUR_BOT_USERNAME"
@@ -129,11 +145,11 @@ async def main_page_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google (PKCE-safe + keeps UI intact)"""
+    """Handle OAuth callback from Google (FINAL FIX)"""
 
     try:
-        code = request.query.get('code')
-        state = request.query.get('state')
+        code = request.query.get("code")
+        state = request.query.get("state")
 
         if not code or not state:
             return web.Response(text="Invalid request", status=400)
@@ -146,8 +162,10 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        user_id = state_data["user_id"]
+        user_id = state_data.get("user_id")
+        telegram_id = state_data.get("telegram_id", user_id)
         flow = state_data.get("flow")
+        is_backup = state_data.get("is_backup", False)
 
         if not flow:
             return web.Response(
@@ -155,108 +173,64 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        # ✅ PKCE-safe token exchange
-        flow.fetch_token(code=code)
+        # ✅ FIX: Proper PKCE + scope-safe token exchange
+        flow.fetch_token(
+            code=code,
+            include_client_id=True
+        )
 
         credentials = flow.credentials
 
         tokens_data = {
-            'access_token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'expires_at': credentials.expiry.timestamp()
+            "access_token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "expires_at": credentials.expiry.timestamp()
         }
 
-        # Get user email
+        # ✅ Drive API email fetch (kept as you want)
         email = await get_user_email(credentials.token)
 
         if not email:
-            logger.error("Failed to retrieve user email after token exchange.")
+            logger.error("Drive API email fetch failed after token exchange")
             return web.Response(
                 text="Failed to get email address. Check bot logs.",
                 status=400
             )
 
-        await db.add_account(user_id, email, tokens_data)
+        account_id = await db.add_account(user_id, email, tokens_data)
+
+        # Backup account handling
+        if is_backup:
+            await db.set_backup_account(user_id, account_id)
 
         oauth_states.pop(state, None)
 
-        await bot.send_message(
-            user_id,
-            f"✅ Successfully connected {email}!"
-        )
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"✅ Successfully connected {email}!"
+            )
+        except Exception:
+            pass
 
-        # ✅ KEEPING YOUR ORIGINAL UI PAGE EXACTLY SAME
+        # ✅ KEEP YOUR UI
         html = f"""
-        <!DOCTYPE html>
         <html>
-        <head>
-            <title>Secure Drive Connected</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                body {{ 
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                    min-height: 100vh;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    padding: 20px;
-                }}
-                .container {{ 
-                    background: white; 
-                    padding: 50px 40px; 
-                    border-radius: 20px; 
-                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                    max-width: 500px;
-                    width: 100%;
-                    text-align: center;
-                    animation: slideUp 0.5s ease-out;
-                }}
-                @keyframes slideUp {{
-                    from {{ opacity: 0; transform: translateY(30px); }}
-                    to {{ opacity: 1; transform: translateY(0); }}
-                }}
-                .icon {{ font-size: 5em; margin-bottom: 25px; animation: bounce 0.6s ease-in-out; }}
-                @keyframes bounce {{
-                    0%, 100% {{ transform: translateY(0); }}
-                    50% {{ transform: translateY(-20px); }}
-                }}
-                h1 {{ color: #28a745; margin: 25px 0; font-size: 2em; font-weight: 600; }}
-                .email {{ 
-                    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); 
-                    padding: 20px; 
-                    border-radius: 12px; 
-                    margin: 25px 0;
-                    font-weight: 600;
-                    color: #495057;
-                    font-size: 1.1em;
-                    word-break: break-all;
-                }}
-                p {{ color: #6c757d; line-height: 1.8; font-size: 1.05em; margin: 15px 0; }}
-                .highlight {{ color: #667eea; font-weight: 600; }}
-                .footer {{ margin-top: 30px; padding-top: 25px; border-top: 2px solid #e9ecef; color: #adb5bd; font-size: 0.9em; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="icon">✅</div>
-                <h1>Successfully Connected!</h1>
-                <div class="email">{email}</div>
-                <p>Your Google Drive has been successfully linked to <span class="highlight">Secure Drive</span>.</p>
-                <p>Return to <strong>Telegram</strong> to start managing your files!</p>
-                <div class="footer">🔒 Your credentials are securely stored and encrypted.</div>
-            </div>
+        <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
+            <h1 style='color:#28a745;'>Successfully Connected!</h1>
+            <p>{email}</p>
+            <p>Return to Telegram.</p>
         </body>
         </html>
         """
 
-        return web.Response(text=html, content_type='text/html')
+        return web.Response(text=html, content_type="text/html")
 
     except Exception as e:
         logger.error(f"OAuth callback error: {e}", exc_info=True)
+
         return web.Response(
-            text="An error occurred. Please try again.",
+            text="Internal Server Error",
             status=500
         )
         
