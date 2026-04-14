@@ -16,6 +16,8 @@ REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-domain.com/oauth_callback
 
 # Google Drive API Scopes
 SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/drive.metadata.readonly"
