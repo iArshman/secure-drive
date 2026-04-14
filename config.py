@@ -23,7 +23,7 @@ SCOPES = [
 
 # MongoDB Configuration
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-DATABASE_NAME = "cloudyte_drive_bot"
+DATABASE_NAME = "secure_drive_bot"
 
 # Web Server Configuration
 PORT = int(os.getenv("PORT", 3000))
