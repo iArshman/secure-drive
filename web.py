@@ -3,6 +3,7 @@ Web server module for OAuth callbacks and status page
 """
 from aiohttp import web, ClientSession
 import logging
+import os
 import time
 
 logger = logging.getLogger(__name__)
@@ -177,7 +178,9 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        # Exchange authorization code securely (PKCE handled automatically)
+        # Exchange authorization code securely
+        # Google may return extra scopes (e.g. openid, userinfo.email) — disable strict check
+        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
         flow.fetch_token(code=code)
 
         credentials = flow.credentials
