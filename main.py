@@ -348,8 +348,6 @@ async def cmd_add(message: Message):
         redirect_uri=REDIRECT_URI
     )
 
-    flow.oauth2session.scope = None
-
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
