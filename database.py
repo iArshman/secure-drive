@@ -70,8 +70,10 @@ class Database:
         )
         
         hashed_pwd = self._hash_password(password)
-        # Generate internal user ID from username only (not telegram_id)
-        internal_id = abs(hash(username)) % (10 ** 10)
+        # Generate deterministic internal user ID from username using SHA256
+        # NOTE: Python's built-in hash() is randomized per-process (PYTHONHASHSEED),
+        # so it changes on every redeploy. We use hashlib for a stable ID.
+        internal_id = int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15)
         
         user_data = {
             'telegram_id': telegram_id,
@@ -118,8 +120,8 @@ class Database:
                 }}
             )
             
-            # Get internal user ID from username
-            internal_id = abs(hash(username)) % (10 ** 10)
+            # Get internal user ID from username using stable SHA256 hash
+            internal_id = int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15)
             return {'success': True, 'internal_user_id': internal_id}
         return {'success': False, 'internal_user_id': None}
     
@@ -144,7 +146,7 @@ class Database:
         """Get internal user ID for currently logged in user"""
         auth_user = await self.get_auth_user(telegram_id)
         if auth_user:
-            return abs(hash(auth_user['username'])) % (10 ** 10)
+            return int(hashlib.sha256(auth_user['username'].encode()).hexdigest(), 16) % (10 ** 15)
         return None
     
     # User Operations
