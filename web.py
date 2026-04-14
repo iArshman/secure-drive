@@ -145,14 +145,20 @@ async def main_page_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google (FINAL WORKING VERSION)"""
+    """Handle OAuth callback from Google (FINAL PKCE-SAFE VERSION)"""
 
     try:
+        import time
+        import requests
+
         code = request.query.get("code")
         state = request.query.get("state")
 
         if not code or not state:
-            return web.Response(text="Invalid request", status=400)
+            return web.Response(
+                text="Invalid request parameters.",
+                status=400
+            )
 
         state_data = oauth_states.get(state)
 
@@ -164,31 +170,50 @@ async def oauth_callback_handler(request):
 
         user_id = state_data.get("user_id")
         telegram_id = state_data.get("telegram_id", user_id)
-        flow = state_data.get("flow")
+        code_verifier = state_data.get("code_verifier")
         is_backup = state_data.get("is_backup", False)
 
-        if not flow:
+        if not code_verifier:
             return web.Response(
-                text="OAuth session missing. Restart connection.",
+                text="OAuth verifier missing. Restart connection.",
                 status=400
             )
 
-        # ✅ Fix scope mismatch issue safely
-        flow.oauth2session.scope = None
-
-        # ✅ Exchange authorization code securely
-        flow.fetch_token(code=code)
-
-        credentials = flow.credentials
-
-        tokens_data = {
-            "access_token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "expires_at": credentials.expiry.timestamp()
+        # 🔐 Exchange authorization code for tokens (PKCE-safe)
+        token_data = {
+            "code": code,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uri": REDIRECT_URI,
+            "grant_type": "authorization_code",
+            "code_verifier": code_verifier
         }
 
-        # ✅ Fetch email using Drive API
-        email = await get_user_email(credentials.token)
+        response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data=token_data
+        )
+
+        tokens = response.json()
+
+        if "access_token" not in tokens:
+            logger.error(f"Token exchange failed: {tokens}")
+            return web.Response(
+                text="Token exchange failed.",
+                status=400
+            )
+
+        access_token = tokens["access_token"]
+        refresh_token = tokens.get("refresh_token")
+
+        tokens_data = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": time.time() + tokens.get("expires_in", 3600)
+        }
+
+        # 📧 Get email using Drive API
+        email = await get_user_email(access_token)
 
         if not email:
             logger.error("Drive API email fetch failed after token exchange")
@@ -197,15 +222,20 @@ async def oauth_callback_handler(request):
                 status=400
             )
 
-        account_id = await db.add_account(user_id, email, tokens_data)
+        account_id = await db.add_account(
+            user_id,
+            email,
+            tokens_data
+        )
 
-        # ✅ Backup account handling
+        # Backup account linking
         if is_backup:
             await db.set_backup_account(user_id, account_id)
 
-        # Remove OAuth state after success
+        # Remove session state after success
         oauth_states.pop(state, None)
 
+        # Notify Telegram user
         try:
             await bot.send_message(
                 telegram_id,
@@ -214,7 +244,7 @@ async def oauth_callback_handler(request):
         except Exception:
             pass
 
-        # ✅ Success UI page (unchanged)
+        # Success UI page
         html = f"""
         <html>
         <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
@@ -225,10 +255,16 @@ async def oauth_callback_handler(request):
         </html>
         """
 
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(
+            text=html,
+            content_type="text/html"
+        )
 
     except Exception as e:
-        logger.error(f"OAuth callback error: {e}", exc_info=True)
+        logger.error(
+            f"OAuth callback error: {e}",
+            exc_info=True
+        )
 
         return web.Response(
             text="Internal Server Error",
