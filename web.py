@@ -1,16 +1,13 @@
 """
-Web server module for Secure Drive - OAuth callbacks, Professional Home Page, and Legal Pages
+Web server module for OAuth callbacks and status page
 """
-import os
-import time
-import json
-import logging
-import base64
 from aiohttp import web, ClientSession
+import logging
+import time
 
 logger = logging.getLogger(__name__)
 
-# Global variables set by main.py
+# Will be set by main.py
 bot = None
 db = None
 oauth_states = None
@@ -28,173 +25,103 @@ def setup_web_module(bot_instance, db_instance, oauth_states_dict, client_id, cl
     CLIENT_SECRET = client_secret
     REDIRECT_URI = redirect_uri
 
-# --- UI Helper: Common Styles ---
-COMMON_STYLE = """
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<style>
-    :root { --primary: #007bff; --bg: #f8f9fa; }
-    body { background-color: var(--bg); font-family: 'Segoe UI', Tahoma, sans-serif; color: #333; line-height: 1.6; }
-    .navbar { background: white; box-shadow: 0 2px 10px rgba(0,0,0,0.05); border-bottom: 2px solid var(--primary); }
-    .hero { background: linear-gradient(135deg, #007bff 0%, #0056b3 100%); color: white; padding: 80px 0; border-radius: 0 0 50px 50px; }
-    .card-custom { border: none; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); background: white; transition: 0.3s; }
-    .card-custom:hover { transform: translateY(-5px); }
-    footer { padding: 40px 0; background: #212529; color: #aaa; margin-top: 50px; }
-    footer a { color: white; text-decoration: none; margin: 0 10px; }
-</style>
-"""
-
-async def get_nav_html():
-    return f"""
-    <nav class="navbar navbar-expand-lg navbar-light sticky-top">
-        <div class="container">
-            <a class="navbar-brand fw-bold text-primary" href="/">☁️ Secure Drive</a>
-            <div class="ms-auto">
-                <a href="/privacy" class="btn btn-sm btn-outline-primary me-2">Privacy</a>
-                <a href="/terms" class="btn btn-sm btn-outline-primary">Terms</a>
-            </div>
-        </div>
-    </nav>
-    """
-
-# --- Google API Helpers ---
 async def get_user_email(access_token):
-    """Get user email using Google OAuth UserInfo endpoint"""
-
+    """Get user email from Google Drive API"""
     try:
-        headers = {
-            "Authorization": f"Bearer {access_token}"
-        }
-
+        headers = {'Authorization': f'Bearer {access_token}'}
         async with ClientSession() as session:
-            async with session.get(
-                "https://www.googleapis.com/oauth2/v3/userinfo",
-                headers=headers
-            ) as response:
-
+            async with session.get('https://www.googleapis.com/drive/v3/about?fields=user', headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get("email")
-
-                logger.error(
-                    f"UserInfo error: {response.status} {await response.text()}"
-                )
-
+                    return data.get('user', {}).get('emailAddress')
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Failed to get user info from Drive API. Status: {response.status}, Response: {error_text}")
     except Exception as e:
-        logger.error(f"Email fetch failed: {e}")
-
+        logger.error(f"Error getting user email: {e}")
     return None
 
-# --- Route Handlers ---
-
 async def main_page_handler(request):
-    """Professional Homepage for Secure Drive Ownership Verification"""
-    bot_info = await bot.get_me()
-    bot_link = f"https://t.me/{bot_info.username}"
+    """Handle main page requests"""
+    bot_username = (await bot.get_me()).username if bot else "YOUR_BOT_USERNAME"
     
     html = f"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <title>Secure Drive - Secure Cloud Management</title>
+        <title>Secure Drive</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        {COMMON_STYLE}
+        <style>
+            body {{ 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                text-align: center; 
+                padding: 50px; 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+            .container {{ 
+                background: white; 
+                padding: 40px; 
+                border-radius: 16px; 
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                max-width: 500px;
+            }}
+            .icon {{ font-size: 4em; margin-bottom: 20px; }}
+            h1 {{ color: #667eea; margin: 20px 0; }}
+            p {{ color: #666; line-height: 1.6; }}
+            .status {{ 
+                background: #28a745; 
+                color: white;
+                padding: 10px 20px; 
+                border-radius: 20px; 
+                display: inline-block;
+                margin: 20px 0;
+                font-weight: bold;
+            }}
+            .feature {{
+                text-align: left;
+                margin: 15px 0;
+                padding: 10px;
+                background: #f8f9fa;
+                border-radius: 8px;
+            }}
+            .bot-link {{
+                display: inline-block;
+                background: #667eea;
+                color: white;
+                padding: 15px 30px;
+                border-radius: 8px;
+                text-decoration: none;
+                margin-top: 20px;
+                font-weight: bold;
+                transition: background 0.3s;
+            }}
+            .bot-link:hover {{
+                background: #764ba2;
+            }}
+        </style>
     </head>
     <body>
-        {await get_nav_html()}
-        <div class="hero text-center">
-            <div class="container">
-                <h1 class="display-4 fw-bold mb-3">Welcome to Secure Drive</h1>
-                <p class="lead mb-4">The ultimate security layer for your Google Drive via Telegram.</p>
-                <a href="{bot_link}" class="btn btn-light btn-lg px-5 fw-bold text-primary">Open @{bot_info.username}</a>
-            </div>
-        </div>
-        
-        <div class="container my-5 text-center">
-            <div class="row g-4">
-                <div class="col-md-4">
-                    <div class="card-custom p-4 h-100">
-                        <h4 class="text-primary">Zero-Knowledge</h4>
-                        <p>We use AES-256 encryption to ensure only you can access your cloud files.</p>
-                    </div>
-                </div>
-                <div class="col-md-4">
-                    <div class="card-custom p-4 h-100">
-                        <h4 class="text-primary">Secure Auth</h4>
-                        <p>Access granted via official Google OAuth 2.0. We never see your password.</p>
-                    </div>
-                </div>
-                <div class="col-md-4">
-                    <div class="card-custom p-4 h-100">
-                        <h4 class="text-primary">Instant Sync</h4>
-                        <p>Manage, upload, and encrypt files directly through your Telegram chat.</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <footer class="text-center">
-            <div class="container">
-                <p>© 2026 <strong>Secure Drive</strong>. Registered to <strong>arshman.me</strong>.</p>
-                <div class="mb-3">
-                    <a href="/privacy">Privacy Policy</a>
-                    <a href="/terms">Terms of Service</a>
-                </div>
-                <p class="small">Disclaimer: This app is not affiliated with Google LLC.</p>
-            </div>
-        </footer>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
-async def privacy_policy_handler(request):
-    """Professional Privacy Policy for Google Verification"""
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head><title>Privacy Policy - Secure Drive</title>{COMMON_STYLE}</head>
-    <body>
-        {await get_nav_html()}
-        <div class="container my-5">
-            <div class="card-custom p-5">
-                <h2 class="text-primary mb-4">Privacy Policy</h2>
-                <p class="text-muted">Effective Date: April 13, 2026</p>
-                <hr>
-                <h5>1. Data Collection</h5>
-                <p>Secure Drive collects your email address and authentication tokens via Google OAuth to provide cloud management services.</p>
-                <h5>2. Google Drive Access</h5>
-                <p>We only access your Google Drive files to perform actions you explicitly trigger via the Telegram bot (Upload, Download, Encrypt). We do not store your raw file content on our servers.</p>
-                <h5>3. Encryption & Security</h5>
-                <p>All data transmitted is protected via TLS 1.3. Your OAuth tokens are encrypted at rest in our database (managed by arshman.me).</p>
-                <h5>4. User Control</h5>
-                <p>You can revoke access at any time through your Google Account security settings or by deleting your account from the bot.</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
-async def terms_of_service_handler(request):
-    """Professional Terms of Service for Google Verification"""
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head><title>Terms of Service - Secure Drive</title>{COMMON_STYLE}</head>
-    <body>
-        {await get_nav_html()}
-        <div class="container my-5">
-            <div class="card-custom p-5">
-                <h2 class="text-primary mb-4">Terms of Service</h2>
-                <hr>
-                <p>By using <strong>Secure Drive</strong>, you agree to the following terms:</p>
-                <ul>
-                    <li>You will not use the service for any illegal storage or transmission of prohibited content.</li>
-                    <li>Secure Drive is a zero-knowledge management tool; we are not responsible for lost encryption keys.</li>
-                    <li>We reserve the right to suspend accounts that violate Google Drive's API policies.</li>
-                </ul>
-            </div>
+        <div class="container">
+            <div class="icon">☁️</div>
+            <h1>Secure Drive</h1>
+            <div class="status"> Running</div>
+            <p>Manage your Google Drive files with Telegram!</p>
+            
+            <div class="feature">📁 Browse and organize files</div>
+            <div class="feature">⬆️ Upload files from Telegram</div>
+            <div class="feature">⬇️ Download files to Telegram</div>
+            <div class="feature">🔍 Search across your Drive</div>
+            <div class="feature">🔗 Generate shareable links</div>
+            <div class="feature">💾 View storage information</div>
+            
+            <a href="https://t.me/{bot_username}" class="bot-link">Open Bot in Telegram</a>
+            <p><a href="/privacy" style="color: #667eea; text-decoration: none;">Privacy Policy</a> • 
+               <a href="/terms" style="color: #667eea; text-decoration: none;">Terms of Service</a></p>
         </div>
     </body>
     </html>
@@ -202,97 +129,292 @@ async def terms_of_service_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google with PKCE-safe token exchange"""
+    """Handle OAuth callback from Google (PKCE-safe + keeps UI intact)"""
 
     try:
-        code = request.query.get("code")
-        state = request.query.get("state")
+        code = request.query.get('code')
+        state = request.query.get('state')
 
         if not code or not state:
-            return web.Response(
-                text="Error: Missing code or state parameters.",
-                status=400
-            )
+            return web.Response(text="Invalid request", status=400)
 
         state_data = oauth_states.get(state)
 
         if not state_data:
             return web.Response(
-                text="Session expired. Please restart connection from Telegram.",
+                text="Session expired. Please reconnect.",
                 status=400
             )
 
-        user_id = state_data.get("user_id")
-        telegram_id = state_data.get("telegram_id")
+        user_id = state_data["user_id"]
         flow = state_data.get("flow")
-        is_backup = state_data.get("is_backup", False)
 
         if not flow:
             return web.Response(
-                text="OAuth flow session missing. Restart connection.",
+                text="OAuth session missing. Restart connection.",
                 status=400
             )
 
-        # Secure PKCE token exchange
+        # ✅ PKCE-safe token exchange
         flow.fetch_token(code=code)
 
         credentials = flow.credentials
 
         tokens_data = {
-            "access_token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "expires_at": credentials.expiry.timestamp()
+            'access_token': credentials.token,
+            'refresh_token': credentials.refresh_token,
+            'expires_at': credentials.expiry.timestamp()
         }
 
-        # Get email safely
+        # Get user email
         email = await get_user_email(credentials.token)
 
         if not email:
+            logger.error("Failed to retrieve user email after token exchange.")
             return web.Response(
-                text="Failed to retrieve account email.",
+                text="Failed to get email address. Check bot logs.",
                 status=400
             )
 
-        account_id = await db.add_account(user_id, email, tokens_data)
-
-        # Handle backup-account setup automatically
-        if is_backup:
-            await db.set_backup_account(user_id, account_id)
+        await db.add_account(user_id, email, tokens_data)
 
         oauth_states.pop(state, None)
 
-        try:
-            await bot.send_message(
-                telegram_id,
-                f"✅ <b>Secure Drive Linked:</b> {email}",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-        return web.Response(
-            text="""
-            <html>
-            <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
-                <h1 style='color:#007bff;'>Success!</h1>
-                <p>Secure Drive connected successfully. Return to Telegram.</p>
-            </body>
-            </html>
-            """,
-            content_type="text/html"
+        await bot.send_message(
+            user_id,
+            f"✅ Successfully connected {email}!"
         )
+
+        # ✅ KEEPING YOUR ORIGINAL UI PAGE EXACTLY SAME
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Secure Drive Connected</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }}
+                .container {{ 
+                    background: white; 
+                    padding: 50px 40px; 
+                    border-radius: 20px; 
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                    animation: slideUp 0.5s ease-out;
+                }}
+                @keyframes slideUp {{
+                    from {{ opacity: 0; transform: translateY(30px); }}
+                    to {{ opacity: 1; transform: translateY(0); }}
+                }}
+                .icon {{ font-size: 5em; margin-bottom: 25px; animation: bounce 0.6s ease-in-out; }}
+                @keyframes bounce {{
+                    0%, 100% {{ transform: translateY(0); }}
+                    50% {{ transform: translateY(-20px); }}
+                }}
+                h1 {{ color: #28a745; margin: 25px 0; font-size: 2em; font-weight: 600; }}
+                .email {{ 
+                    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); 
+                    padding: 20px; 
+                    border-radius: 12px; 
+                    margin: 25px 0;
+                    font-weight: 600;
+                    color: #495057;
+                    font-size: 1.1em;
+                    word-break: break-all;
+                }}
+                p {{ color: #6c757d; line-height: 1.8; font-size: 1.05em; margin: 15px 0; }}
+                .highlight {{ color: #667eea; font-weight: 600; }}
+                .footer {{ margin-top: 30px; padding-top: 25px; border-top: 2px solid #e9ecef; color: #adb5bd; font-size: 0.9em; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="icon">✅</div>
+                <h1>Successfully Connected!</h1>
+                <div class="email">{email}</div>
+                <p>Your Google Drive has been successfully linked to <span class="highlight">Secure Drive</span>.</p>
+                <p>Return to <strong>Telegram</strong> to start managing your files!</p>
+                <div class="footer">🔒 Your credentials are securely stored and encrypted.</div>
+            </div>
+        </body>
+        </html>
+        """
+
+        return web.Response(text=html, content_type='text/html')
 
     except Exception as e:
-        logger.error(f"OAuth callback error: {e}")
-
+        logger.error(f"OAuth callback error: {e}", exc_info=True)
         return web.Response(
-            text="Internal Server Error",
+            text="An error occurred. Please try again.",
             status=500
         )
-
         
+async def privacy_policy_handler(request):
+    """Handle privacy policy page"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Privacy Policy - Secure Drive</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #333; background: #f8f9fa; }
+            .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 15px; margin-bottom: 30px; }
+            h2 { color: #495057; margin-top: 30px; margin-bottom: 15px; }
+            .last-updated { color: #6c757d; font-style: italic; margin-bottom: 30px; }
+            a { color: #667eea; text-decoration: none; }
+            .highlight { background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Privacy Policy</h1>
+            <p class="last-updated">Last Updated: December 20, 2025</p>
+            
+            <h2>1. Introduction</h2>
+            <p>Secure Drive ("we", "our", or "the bot") provides Google Drive management services through Telegram. This Privacy Policy explains how we collect, use, store, and delete your data.</p>
+            
+            <h2>2. Information We Collect</h2>
+            <p>We collect and process the following information:</p>
+            <ul>
+                <li><strong>Telegram User ID:</strong> Your unique Telegram identifier to link your account</li>
+                <li><strong>Google Drive Email:</strong> The email address associated with your connected Google Drive account</li>
+                <li><strong>OAuth Access Tokens:</strong> Encrypted tokens to access your Google Drive on your behalf</li>
+                <li><strong>File Metadata:</strong> Temporary file information (names, IDs, types) during operations</li>
+            </ul>
+            
+            <h2>3. How We Use Your Information</h2>
+            <p>Your data is used exclusively for:</p>
+            <ul>
+                <li>Authenticating and managing your Google Drive accounts</li>
+                <li>Browsing, uploading, downloading, and searching files</li>
+                <li>Creating shareable links</li>
+                <li>Performing file operations (rename, delete, organize)</li>
+            </ul>
+            <p><strong>We do NOT:</strong> Store file contents permanently, share your data with third parties, use your data for advertising, or access your Drive without explicit user commands.</p>
+            
+            <h2>4. Data Storage and Security</h2>
+            <p>We implement industry-standard security measures:</p>
+            <ul>
+                <li><strong>Encryption:</strong> OAuth tokens are encrypted using AES-256 encryption</li>
+                <li><strong>Secure Database:</strong> All data is stored in MongoDB with access controls</li>
+                <li><strong>No File Storage:</strong> File contents are never permanently stored on our servers</li>
+                <li><strong>Secure Transmission:</strong> All API communications use HTTPS/TLS</li>
+            </ul>
+            
+            <h2>5. Data Retention and Deletion</h2>
+            <div class="highlight">
+                <strong>Data Retention:</strong>
+                <ul>
+                    <li><strong>Account Data:</strong> We retain your Telegram User ID, connected email addresses, and OAuth tokens for as long as your Google Drive account remains connected to the bot</li>
+                    <li><strong>File Metadata:</strong> Temporary file information is retained only during active operations and is automatically deleted after completion</li>
+                    <li><strong>Session Data:</strong> OAuth states and temporary session data expire after 1 hour</li>
+                </ul>
+                
+                <strong>Data Deletion:</strong>
+                <p>You have full control over your data. We delete your information in the following ways:</p>
+                <ul>
+                    <li><strong>Manual Deletion:</strong> Use the /settings command in the bot and select "Remove Account" to immediately delete all stored data for that specific Google Drive account, including OAuth tokens and account information</li>
+                    <li><strong>Complete Account Removal:</strong> All your data is permanently deleted from our database within 24 hours of account disconnection</li>
+                    <li><strong>Inactive Accounts:</strong> Accounts inactive for more than 12 months may be automatically purged from our system</li>
+                    <li><strong>Upon Request:</strong> Contact us at support@arshman.space to request immediate data deletion, and we will comply within 7 business days</li>
+                </ul>
+                <p><strong>Note:</strong> After deletion, you will need to re-authenticate if you wish to use the service again. Data deletion is irreversible.</p>
+            </div>
+            
+            <h2>6. Google API Services User Data Policy</h2>
+            <p>Secure Drive's use and transfer of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+            <p>We only request the minimum necessary permissions to provide our service and never use your Google user data for purposes unrelated to providing and improving Secure's features.</p>
+            
+            <h2>7. Third-Party Services</h2>
+            <p>We use the following third-party services:</p>
+            <ul>
+                <li><strong>Telegram:</strong> For bot messaging interface</li>
+                <li><strong>Google Drive API:</strong> For file operations</li>
+                <li><strong>MongoDB:</strong> For secure data storage</li>
+            </ul>
+            <p>Each service has its own privacy policy and data handling practices.</p>
+            
+            <h2>8. Your Rights</h2>
+            <p>You have the right to:</p>
+            <ul>
+                <li>Access your stored data</li>
+                <li>Request data deletion at any time</li>
+                <li>Revoke Google Drive access</li>
+                <li>Disconnect your account</li>
+            </ul>
+            
+            <h2>9. Changes to This Policy</h2>
+            <p>We may update this Privacy Policy from time to time. Continued use of the bot after changes constitutes acceptance of the updated policy.</p>
+            
+            <h2>10. Contact Us</h2>
+            <p>For questions or concerns about this Privacy Policy or your data, contact us at: <a href="mailto:support@arshman.space">support@arshman.space</a></p>
+            
+            <p style="margin-top: 40px; text-align: center;"><a href="/">← Back to Home</a></p>
+        </div>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
+async def terms_of_service_handler(request):
+    """Handle terms of service page"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Terms of Service - Secure Drive</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #333; background: #f8f9fa; }
+            .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 15px; margin-bottom: 30px; }
+            h2 { color: #495057; margin-top: 30px; margin-bottom: 15px; }
+            .last-updated { color: #6c757d; font-style: italic; margin-bottom: 30px; }
+            a { color: #667eea; text-decoration: none; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Terms of Service</h1>
+            <p class="last-updated">Last Updated: December 12, 2025</p>
+            
+            <h2>1. Acceptance of Terms</h2>
+            <p>By using Secure Drive, you agree to these Terms of Service.</p>
+            
+            <h2>2. Description of Service</h2>
+            <p>Secure Drive allows managing Google Drive files through Telegram, including browsing, uploading, downloading, searching, and sharing.</p>
+            
+            <h2>3. User Responsibilities</h2>
+            <p>Use the service lawfully, keep your account secure, and respect others' data.</p>
+            
+            <h2>4. Drive Account Access</h2>
+            <p>By connecting, you grant Secure drive permission to read, create, modify, and delete files in your Drive on your behalf.</p>
+            
+            <h2>5. Data Privacy</h2>
+            <p>See our <a href="/privacy">Privacy Policy</a> for details on data handling.</p>
+            
+            <p style="margin-top: 40px; text-align: center;"><a href="/">← Back to Home</a></p>
+        </div>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
 def create_web_app():
-    """Build the aiohttp web application"""
+    """Create and configure the web application"""
     app = web.Application()
     app.router.add_get('/', main_page_handler)
     app.router.add_get('/oauth_callback', oauth_callback_handler)
