@@ -760,7 +760,19 @@ async def handle_user_input(message: Message):
 
 async def main():
     global bot, db, dp
-    bot = Bot(token=BOT_TOKEN)
+    
+    # === LOCAL SERVER LOGIC ADDED HERE ===
+    if USE_LOCAL_SERVER:
+        session = AiohttpSession(
+            api=TelegramAPIServer.from_base(LOCAL_SERVER_URL, is_local=True)
+        )
+        bot = Bot(token=BOT_TOKEN, session=session)
+        logger.info(f"Bot initialized using Local Server: {LOCAL_SERVER_URL}")
+    else:
+        bot = Bot(token=BOT_TOKEN)
+        logger.info("Bot initialized using Standard Telegram API")
+    # =====================================
+
     db = Database()
     dp = Dispatcher()
     
