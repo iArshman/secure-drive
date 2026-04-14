@@ -161,7 +161,7 @@ class Database:
             'default_account_id': None,
             'backup_account_id': None,
             'backup_enabled': False,
-            'encryption_enabled': True,
+            'encryption_enabled': False,
             'created_at': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc)
         }
@@ -299,17 +299,18 @@ class Database:
         """Get account by email for specific user"""
         return await self.accounts.find_one({'user_id': user_id, 'email': email})
 
-# Global database instance
-db = Database()
-    
+
     # Encryption Settings
     async def is_encryption_enabled(self, user_id: int) -> bool:
-        """Check if encryption is enabled for user (default: True)"""
+        """Check if encryption is enabled for user (default: False)"""
         user = await self.get_user(user_id)
         if not user:
-            return True
-        return user.get('encryption_enabled', True)
-    
+            return False
+        return user.get('encryption_enabled', False)
+
     async def toggle_encryption(self, user_id: int, enabled: bool):
         """Enable or disable encryption for user"""
         await self.update_user(user_id, {'encryption_enabled': enabled})
+
+# Global database instance
+db = Database()
