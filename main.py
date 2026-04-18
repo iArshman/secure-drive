@@ -4,11 +4,44 @@ import asyncio
 import html
 import hashlib
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple, Any
 
 _executor = ThreadPoolExecutor(max_workers=8)
+
+# ============= SPEED CACHES =============
+
+# Folder listing cache: "{account_id}:{folder_id}:{page_token}" → (processed_files, next_pt, title, timestamp)
+_folder_cache: Dict[str, Tuple[list, Any, str, float]] = {}
+FOLDER_CACHE_TTL = 45  # seconds — sweet spot between freshness and speed
+
+# Drive service object cache: account_id → service  (avoid rebuilding credentials every call)
+_service_cache: Dict[str, Any] = {}
+
+def _folder_cache_key(account_id: str, folder_id: str, page_token: str = None) -> str:
+    return f"{account_id}:{folder_id}:{page_token or ''}"
+
+def _get_folder_cache(key: str):
+    entry = _folder_cache.get(key)
+    if entry:
+        files, next_pt, title, ts = entry
+        if time.monotonic() - ts < FOLDER_CACHE_TTL:
+            return files, next_pt, title
+    return None
+
+def _set_folder_cache(key: str, files: list, next_pt, title: str):
+    _folder_cache[key] = (files, next_pt, title, time.monotonic())
+
+def _invalidate_folder_cache(account_id: str, folder_id: str = None):
+    """Call after any mutation (upload, delete, rename, mkdir) to drop stale entries."""
+    keys_to_drop = [
+        k for k in _folder_cache
+        if k.startswith(f"{account_id}:{folder_id or ''}") or k.startswith(f"{account_id}:")
+    ]
+    for k in keys_to_drop:
+        _folder_cache.pop(k, None)
 from bson import ObjectId
 
 from aiogram import Bot, Dispatcher, F
@@ -105,66 +138,98 @@ async def store_file_data(account_id: str, file_id: str, parent_id: str = "root"
     )
     return hash_value
 
-def get_drive_service(access_token: str, refresh_token: str = None):
+def get_drive_service(access_token: str, refresh_token: str = None, account_id: str = None):
+    # Return cached service object if available — avoids rebuilding credentials on every call
+    if account_id and account_id in _service_cache:
+        return _service_cache[account_id]
     creds = Credentials.from_authorized_user_info({
         'token': access_token, 'refresh_token': refresh_token,
         'token_uri': 'https://oauth2.googleapis.com/token',
         'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET
     }, SCOPES)
-    return build('drive', 'v3', credentials=creds)
+    service = build('drive', 'v3', credentials=creds)
+    if account_id:
+        _service_cache[account_id] = service
+    return service
 
 # ============= RENDERERS =============
 
 async def render_explorer(event, account_id: str, folder_id: str = "root", page_token: str = None, search_query: str = None, parent_id: str = None):
     try:
         account = await db.accounts.find_one({"_id": ObjectId(account_id)})
-        service = get_drive_service(account['access_token'], account.get('refresh_token'))
-
-        query = f"'{folder_id}' in parents and trashed=false"
-        if search_query: query = "trashed=false"
-
+        # Use cached service object
+        service = get_drive_service(account['access_token'], account.get('refresh_token'), account_id=account_id)
         enc_on = await enc(account['user_id'])
 
-        # Run blocking Drive API calls in thread pool to avoid blocking the event loop
-        def fetch_files():
-            # Fetch folder name and files in one efficient block
-            folder_name = None
-            if folder_id != "root":
+        cache_key = _folder_cache_key(account_id, folder_id, page_token)
+        cached = None if search_query else _get_folder_cache(cache_key)
+
+        if cached:
+            processed_files, next_pt, title = cached
+            # Filter search locally against cache — no extra API call
+        else:
+            query = f"'{folder_id}' in parents and trashed=false"
+            if search_query:
+                query = "trashed=false"
+
+            # Fetch folder title and file list IN PARALLEL using asyncio.gather
+            loop = asyncio.get_event_loop()
+
+            def fetch_title():
+                if folder_id == "root":
+                    return None
                 try:
-                    meta = service.files().get(fileId=folder_id, fields='name').execute()
-                    folder_name = meta.get('name')
+                    return service.files().get(fileId=folder_id, fields='name').execute().get('name')
                 except:
-                    pass
-            results = service.files().list(
-                q=query, pageSize=100, pageToken=page_token,
-                fields="files(id, name, mimeType, size), nextPageToken"
-            ).execute()
-            return folder_name, results
+                    return None
 
-        folder_name_raw, results = await asyncio.get_event_loop().run_in_executor(_executor, fetch_files)
+            def fetch_listing():
+                return service.files().list(
+                    q=query, pageSize=100, pageToken=page_token,
+                    fields="files(id, name, mimeType, size), nextPageToken"
+                ).execute()
 
-        raw_files = results.get('files', [])
-        next_pt = results.get('nextPageToken')
+            folder_name_raw, results = await asyncio.gather(
+                loop.run_in_executor(_executor, fetch_title),
+                loop.run_in_executor(_executor, fetch_listing)
+            )
 
-        title = decrypt_name(folder_name_raw, enc_on) if folder_name_raw else "Root"
+            raw_files = results.get('files', [])
+            next_pt = results.get('nextPageToken')
+            title = decrypt_name(folder_name_raw, enc_on) if folder_name_raw else "Root"
 
-        processed_files = []
-        for f in raw_files:
-            real_name = decrypt_name(f['name'], enc_on)
-            if search_query and search_query.lower() not in real_name.lower(): continue
-            processed_files.append({'id': f['id'], 'name': real_name, 'mimeType': f['mimeType'], 'size': f.get('size')})
+            processed_files = []
+            for f in raw_files:
+                real_name = decrypt_name(f['name'], enc_on)
+                processed_files.append({'id': f['id'], 'name': real_name, 'mimeType': f['mimeType'], 'size': f.get('size')})
+            processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
 
-        processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
+            # Store in cache (only non-search results)
+            if not search_query:
+                _set_folder_cache(cache_key, processed_files, next_pt, title)
+
+            # Prefetch top 3 subfolders in the background so navigating into them is instant
+            if not search_query and not page_token:
+                subfolders = [f for f in processed_files if f['mimeType'] == 'application/vnd.google-apps.folder'][:3]
+                for sf in subfolders:
+                    sf_key = _folder_cache_key(account_id, sf['id'])
+                    if not _get_folder_cache(sf_key):
+                        asyncio.create_task(_prefetch_folder(service, account_id, sf['id'], enc_on))
+
+        # Apply search filter locally (works on both cached and fresh results)
+        display_files = processed_files
+        if search_query:
+            display_files = [f for f in processed_files if search_query.lower() in f['name'].lower()]
 
         text = f"<b>{escape_html(title)}</b>\nAccount: <code>{escape_html(account.get('email', 'Unknown'))}</code>\n━━━━━━━━━━━━━━━━━━\n"
-        if not processed_files: text += "<i>Empty folder.</i>"
+        if not display_files: text += "<i>Empty folder.</i>"
 
         keyboard = []
-        for f in [x for x in processed_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
+        for f in [x for x in display_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
             h = await store_file_data(account_id, f['id'], folder_id)
             keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
-        files_list = [x for x in processed_files if x['mimeType'] != 'application/vnd.google-apps.folder']
+        files_list = [x for x in display_files if x['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(files_list), 2):
             row = []
             for f in files_list[i:i+2]:
@@ -181,7 +246,6 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         controls = []
         if not search_query:
             if folder_id != "root":
-                # FIX: Use actual parent_id for back button instead of always going to root
                 back_target = parent_id if parent_id and parent_id != folder_id else "root"
                 back_h = await store_file_data(account_id, back_target, back_target)
                 controls.append(InlineKeyboardButton(text="← Back", callback_data=f"back:{back_h}"))
@@ -201,6 +265,39 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         err_msg = "Error fetching files."
         if isinstance(event, CallbackQuery): await event.answer(err_msg)
         else: await event.answer(err_msg)
+
+
+async def _prefetch_folder(service, account_id: str, folder_id: str, enc_on: bool):
+    """Background task: silently fetch and cache a subfolder's contents."""
+    try:
+        cache_key = _folder_cache_key(account_id, folder_id)
+        if _get_folder_cache(cache_key):
+            return  # Already cached by the time we get here
+
+        def do_fetch():
+            results = service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                pageSize=100,
+                fields="files(id, name, mimeType, size), nextPageToken"
+            ).execute()
+            title_raw = None
+            try:
+                title_raw = service.files().get(fileId=folder_id, fields='name').execute().get('name')
+            except:
+                pass
+            return results, title_raw
+
+        results, title_raw = await asyncio.get_event_loop().run_in_executor(_executor, do_fetch)
+        title = decrypt_name(title_raw, enc_on) if title_raw else "Folder"
+        next_pt = results.get('nextPageToken')
+        files = []
+        for f in results.get('files', []):
+            files.append({'id': f['id'], 'name': decrypt_name(f['name'], enc_on), 'mimeType': f['mimeType'], 'size': f.get('size')})
+        files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
+        _set_folder_cache(cache_key, files, next_pt, title)
+        logger.debug(f"Prefetched folder {folder_id} ({len(files)} items)")
+    except Exception as e:
+        logger.debug(f"Prefetch failed for {folder_id}: {e}")
 
 async def render_file_info(callback: CallbackQuery, h: str):
     f_data = await db.callback_data.find_one({"hash": h})
@@ -492,7 +589,11 @@ async def handle_callback(callback: CallbackQuery):
         f_data = await db.callback_data.find_one({"hash": h})
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
         try:
-            get_drive_service(acc['access_token'], acc.get('refresh_token')).files().delete(fileId=f_data['file_id']).execute()
+            svc = get_drive_service(acc['access_token'], acc.get('refresh_token'), account_id=f_data['account_id'])
+            await asyncio.get_event_loop().run_in_executor(
+                _executor, lambda: svc.files().delete(fileId=f_data['file_id']).execute()
+            )
+            _invalidate_folder_cache(f_data['account_id'], f_data['parent_id'])
             await callback.answer("Deleted successfully")
             await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
         except Exception as e:
@@ -502,12 +603,12 @@ async def handle_callback(callback: CallbackQuery):
         h = data.split(":")[1]
         await render_file_info(callback, h)
 
-    # [FIX] Download stream correctly - run in executor to avoid blocking
+    # Download - run in executor, use cached service
     elif data.startswith("down:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
-        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'), account_id=f_data['account_id'])
         enc_on = await enc(acc['user_id'])
 
         def fetch_meta_and_download():
@@ -559,7 +660,7 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer("Enter new name:")
 
     elif data.startswith("mkdir:"):
-        #  store state under telegram_id (not internal user_id) to match handle_user_input lookup
+        # FIX: store state under telegram_id (not internal user_id) to match handle_user_input lookup
         # Also store account_id so we can navigate back to the right account after creation
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or await db.accounts.find_one({"user_id": user_id})
         user_states[telegram_id] = {
@@ -745,11 +846,11 @@ async def handle_user_input(message: Message):
         f_data = await db.callback_data.find_one({"hash": state['hash']})
         enc_on = await enc(user_id)
         new_enc_name = encrypt_name(message.text, enc_on)
-        # FIX: run blocking Drive call in executor
         await asyncio.get_event_loop().run_in_executor(
             _executor,
             lambda: service.files().update(fileId=f_data['file_id'], body={'name': new_enc_name}).execute()
         )
+        _invalidate_folder_cache(f_data['account_id'], f_data['parent_id'])
         await message.answer("Renamed successfully")
         del user_states[telegram_id]
         await render_explorer(message, f_data['account_id'], f_data['parent_id'])
@@ -760,18 +861,17 @@ async def handle_user_input(message: Message):
         if not folder_name:
             return await message.answer("❌ Folder name cannot be empty. Please try again.")
         parent_id = state['parent_id']
-        # FIX: use account_id stored in state so we go back to the right place
         account_id = state.get('account_id') or str(acc['_id'])
         meta = {
             'name': encrypt_name(folder_name, enc_on),
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [parent_id] if parent_id != "root" else []
         }
-        # FIX: run blocking Drive call in executor
         await asyncio.get_event_loop().run_in_executor(
             _executor,
             lambda: service.files().create(body=meta).execute()
         )
+        _invalidate_folder_cache(account_id, parent_id)
         await message.answer(f"✅ Folder <b>{escape_html(folder_name)}</b> created successfully", parse_mode="HTML")
         del user_states[telegram_id]
         await render_explorer(message, account_id, parent_id)
@@ -802,6 +902,7 @@ async def handle_user_input(message: Message):
                     media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                     service.files().create(body=meta, media_body=media).execute()
                 await asyncio.get_event_loop().run_in_executor(_executor, do_upload)
+                _invalidate_folder_cache(str(acc['_id']), state['parent_id'])
                 
                 # Backup logic
                 if await db.is_backup_enabled(user_id):
