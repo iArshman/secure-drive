@@ -701,7 +701,7 @@ async def main():
     global bot, db, dp
     
     if USE_LOCAL_SERVER:
-        session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_SERVER_URL, is_local=True))
+        session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_SERVER_URL, is_local=False))
         bot = Bot(token=BOT_TOKEN, session=session)
         logger.info(f"Bot initialized using Local Server: {LOCAL_SERVER_URL}")
     else:
