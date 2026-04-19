@@ -25,6 +25,7 @@ from config import BOT_TOKEN, USE_LOCAL_SERVER, LOCAL_SERVER_URL, CLIENT_ID, CLI
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 import web as web_module
+import aiohttp
 
 # Logging
 logging.basicConfig(
@@ -107,6 +108,35 @@ def get_drive_service(access_token: str, refresh_token: str = None):
         'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET
     }, SCOPES)
     return build('drive', 'v3', credentials=creds)
+
+async def download_file_from_local_server(file_path: str, bot_token: str) -> io.BytesIO:
+    """
+    Download file directly from local Telegram API server via HTTP streaming.
+    This bypasses the bot.download() file size limit when using local server.
+    """
+    if not USE_LOCAL_SERVER:
+        raise ValueError("This function only works with local Telegram API server")
+    
+    # Construct direct download URL from local server
+    download_url = f"{LOCAL_SERVER_URL}/file/bot{bot_token}/{file_path}"
+    logger.info(f"[v0] Downloading from local server: {download_url}")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(download_url) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Download failed: HTTP {resp.status}")
+                
+                file_buffer = io.BytesIO()
+                async for chunk in resp.content.iter_chunked(10 * 1024 * 1024):  # 10MB chunks
+                    file_buffer.write(chunk)
+                
+                file_buffer.seek(0)
+                logger.info(f"[v0] Downloaded {len(file_buffer.getvalue())} bytes")
+                return file_buffer
+    except Exception as e:
+        logger.error(f"[v0] Local server download failed: {e}")
+        raise
 
 # ============= RENDERERS =============
 
@@ -739,26 +769,27 @@ async def handle_user_input(message: Message):
         elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
         if file_obj and hasattr(file_obj, 'file_size') and file_obj.file_size:
-            # Account for encryption overhead (~10% larger) when validating file size
-            encryption_overhead = 1.15  # 15% overhead for encryption
-            max_downloadable = MAX_UPLOAD_SIZE // int(encryption_overhead)
-            
-            if file_obj.file_size > max_downloadable:
-                limit_mb = max_downloadable // (1024 * 1024)
-                return await message.answer(f"File too big! Limit is {limit_mb}MB (accounting for encryption)")
+            # Check against actual limit
+            if file_obj.file_size > MAX_UPLOAD_SIZE:
+                limit_mb = MAX_UPLOAD_SIZE // (1024 * 1024)
+                return await message.answer(f"File too big! Limit is {limit_mb}MB")
 
             msg = await message.reply(f"Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             try:
-                file_io = await bot.download(file_obj)
+                # Download file - use direct HTTP for local server to bypass size limits
+                if USE_LOCAL_SERVER:
+                    logger.info("[v0] Using local server direct download (bypasses file size limits)")
+                    try:
+                        file_io = await download_file_from_local_server(file_obj.file_path, BOT_TOKEN)
+                    except Exception as local_error:
+                        logger.warning(f"[v0] Local download failed: {local_error}, falling back to bot.download()")
+                        file_io = await bot.download(file_obj)
+                else:
+                    file_io = await bot.download(file_obj)
+                
                 file_bytes = file_io.read()
                 enc_on = await enc(user_id)
                 enc_bytes = encrypt_data(file_bytes, enc_on)
-                
-                # Final check before uploading - ensure encrypted size doesn't exceed limit
-                if len(enc_bytes) > MAX_UPLOAD_SIZE:
-                    await msg.edit_text(f"File too large after encryption! {len(enc_bytes)//(1024*1024)}MB > {MAX_UPLOAD_SIZE//(1024*1024)}MB limit")
-                    return
-                
                 enc_name = encrypt_name(filename, enc_on)
                 meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
                 
