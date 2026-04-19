@@ -1054,6 +1054,27 @@ async def handle_user_input(message: Message):
         return
 
 
+async def read_telegram_file(file_obj) -> bytes:
+    """
+    Read file bytes from Telegram.
+    - Local server mode: the local API server saves files to disk.
+      bot.get_file() returns a file_path that is an absolute path on disk.
+      We read it directly — bot.download() doesn't work in local mode.
+    - Standard API mode: use bot.download() as normal (max 50 MB).
+    """
+    if USE_LOCAL_SERVER:
+        tg_file = await bot.get_file(file_obj.file_id)
+        file_path = tg_file.file_path  # absolute disk path from local server
+        # The local server returns a path like /home/ubuntu/<token>/documents/file_0.apk
+        # Read it directly from disk
+        loop = asyncio.get_event_loop()
+        file_bytes = await loop.run_in_executor(None, lambda: open(file_path, 'rb').read())
+        return file_bytes
+    else:
+        file_io = await bot.download(file_obj)
+        return file_io.read()
+
+
 async def handle_file_upload(message: Message, telegram_id: int, user_id: int, state: dict):
     """Handles file upload for both single and batch modes."""
     file_obj = None
@@ -1077,7 +1098,7 @@ async def handle_file_upload(message: Message, telegram_id: int, user_id: int, s
         filename = f"photo_{message.message_id}.jpg"
         mime_type = 'image/jpeg'
     else:
-        # Not a file message; ignore silently (could be text in batch mode)
+        # Not a file message — silently ignore (text in batch mode etc.)
         return
 
     if file_obj.file_size > MAX_UPLOAD_SIZE:
@@ -1102,12 +1123,17 @@ async def handle_file_upload(message: Message, telegram_id: int, user_id: int, s
     enc_on = await enc(user_id)
     parent_id = state.get('parent_id', 'root')
 
+    # Clear state IMMEDIATELY for single upload so any new messages don't re-trigger this.
+    # For batch upload we keep the state so the user can keep sending files.
+    is_single = state['action'] == "upload_file"
+    if is_single:
+        user_states.pop(telegram_id, None)
+
     msg = await message.reply(f"⬆️ Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
 
     try:
-        # Download file from Telegram
-        file_io = await bot.download(file_obj)
-        file_bytes = file_io.read()
+        # Read file bytes (local server reads from disk, standard API streams)
+        file_bytes = await read_telegram_file(file_obj)
 
         # Encrypt if needed
         upload_bytes = encrypt_data(file_bytes, enc_on)
@@ -1116,7 +1142,7 @@ async def handle_file_upload(message: Message, telegram_id: int, user_id: int, s
         parents = [parent_id] if parent_id and parent_id != "root" else []
         meta = {'name': upload_name, 'parents': parents}
 
-        # Use resumable upload for larger files
+        # Resumable upload for reliability with large files
         media = MediaIoBaseUpload(
             io.BytesIO(upload_bytes),
             mimetype='application/octet-stream',
@@ -1146,16 +1172,12 @@ async def handle_file_upload(message: Message, telegram_id: int, user_id: int, s
 
         await msg.edit_text(f"✅ Uploaded: <b>{escape_html(filename)}</b>{backup_status}", parse_mode="HTML")
 
-        # Clear state and refresh explorer only for single upload
-        if state['action'] == "upload_file":
-            user_states.pop(telegram_id, None)
+        if is_single:
             await render_explorer(message, str(acc['_id']), parent_id)
 
     except Exception as e:
         logger.error(f"Upload error: {e}", exc_info=True)
         await msg.edit_text(f"⚠️ Upload failed: {escape_html(str(e))}", parse_mode="HTML")
-        if state['action'] == "upload_file":
-            user_states.pop(telegram_id, None)
 
 # ============= MAIN =============
 
