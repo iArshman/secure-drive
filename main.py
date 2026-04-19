@@ -1057,52 +1057,34 @@ async def handle_user_input(message: Message):
 
 async def read_telegram_file(file_obj) -> bytes:
     """
-    Read file bytes from Telegram.
+    Fetch file bytes from Telegram.
 
     Local server mode:
-      The local Telegram API server stores files directly on disk.
-      The file object already has a `file_path` attribute that IS the absolute
-      disk path (e.g. /home/ubuntu/<token>/documents/file_0.apk).
-      DO NOT call bot.get_file() — it fails with 'file is too big' for large
-      files because getFile has its own size limit even on local servers.
-      Just open the path directly.
+      The local API server runs on the same host as the bot (no Docker isolation).
+      Files are served over HTTP at: LOCAL_SERVER_URL/file/bot<TOKEN>/<file_path>
+      The file_path is already on the file object — no bot.get_file() call needed
+      (get_file fails with 'file is too big' for large files even on local servers).
 
     Standard API mode:
-      Use bot.download() as normal (Telegram cap: 20 MB upload / 50 MB download).
+      Use bot.download() normally (50 MB cap).
     """
     if USE_LOCAL_SERVER:
-        # The local Telegram API server stores files on disk.
-        # aiogram sets file_path on the object when local server is used.
-        # The path is RELATIVE, e.g. "8616018696:TOKEN/documents/file_0.apk"
-        # The local server working directory (where files are stored) must be
-        # mounted into the Docker container and set via LOCAL_FILES_PATH env var.
-        # Default: /home/ubuntu (the host path where local server stores files).
         file_path = getattr(file_obj, 'file_path', None)
-
         if not file_path:
-            raise RuntimeError(
-                "file_path is not set on the file object. "
-                "Make sure you are using aiogram with local server mode."
-            )
+            raise RuntimeError("file_path not available on file object.")
 
-        # Resolve to absolute path inside the container
-        local_files_root = os.getenv("LOCAL_FILES_PATH", "/var/lib/telegram-bot-api")
-        if not os.path.isabs(file_path):
-            file_path = os.path.join(local_files_root, file_path)
+        url = f"{LOCAL_SERVER_URL}/file/bot{BOT_TOKEN}/{file_path}"
+        logger.info(f"Downloading from local server: {url}")
 
-        loop = asyncio.get_event_loop()
-        file_bytes = await loop.run_in_executor(None, _read_file_sync, file_path)
-        return file_bytes
+        from aiohttp import ClientSession, ClientTimeout
+        async with ClientSession(timeout=ClientTimeout(total=600)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Local server HTTP {resp.status} for {url}")
+                return await resp.read()
     else:
         file_io = await bot.download(file_obj)
         return file_io.read()
-
-
-def _read_file_sync(file_path: str) -> bytes:
-    """Synchronous file read — runs in executor to avoid blocking the event loop."""
-    with open(file_path, 'rb') as f:
-        return f.read()
-
 
 async def handle_file_upload(message: Message, telegram_id: int, user_id: int, state: dict):
     """Handles file upload for both single and batch modes."""
