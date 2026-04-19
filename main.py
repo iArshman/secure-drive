@@ -4,44 +4,8 @@ import asyncio
 import html
 import hashlib
 import io
-import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Optional, Dict, Tuple, Any
-
-_executor = ThreadPoolExecutor(max_workers=8)
-
-# ============= SPEED CACHES =============
-
-# Folder listing cache: "{account_id}:{folder_id}:{page_token}" → (processed_files, next_pt, title, timestamp)
-_folder_cache: Dict[str, Tuple[list, Any, str, float]] = {}
-FOLDER_CACHE_TTL = 45  # seconds — sweet spot between freshness and speed
-
-# Drive service object cache: account_id → service  (avoid rebuilding credentials every call)
-_service_cache: Dict[str, Any] = {}
-
-def _folder_cache_key(account_id: str, folder_id: str, page_token: str = None) -> str:
-    return f"{account_id}:{folder_id}:{page_token or ''}"
-
-def _get_folder_cache(key: str):
-    entry = _folder_cache.get(key)
-    if entry:
-        files, next_pt, title, ts = entry
-        if time.monotonic() - ts < FOLDER_CACHE_TTL:
-            return files, next_pt, title
-    return None
-
-def _set_folder_cache(key: str, files: list, next_pt, title: str):
-    _folder_cache[key] = (files, next_pt, title, time.monotonic())
-
-def _invalidate_folder_cache(account_id: str, folder_id: str = None):
-    """Call after any mutation (upload, delete, rename, mkdir) to drop stale entries."""
-    keys_to_drop = [
-        k for k in _folder_cache
-        if k.startswith(f"{account_id}:{folder_id or ''}") or k.startswith(f"{account_id}:")
-    ]
-    for k in keys_to_drop:
-        _folder_cache.pop(k, None)
+from typing import Optional, Dict
 from bson import ObjectId
 
 from aiogram import Bot, Dispatcher, F
@@ -138,98 +102,53 @@ async def store_file_data(account_id: str, file_id: str, parent_id: str = "root"
     )
     return hash_value
 
-def get_drive_service(access_token: str, refresh_token: str = None, account_id: str = None):
-    # Return cached service object if available — avoids rebuilding credentials on every call
-    if account_id and account_id in _service_cache:
-        return _service_cache[account_id]
+def get_drive_service(access_token: str, refresh_token: str = None):
     creds = Credentials.from_authorized_user_info({
         'token': access_token, 'refresh_token': refresh_token,
         'token_uri': 'https://oauth2.googleapis.com/token',
         'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET
     }, SCOPES)
-    service = build('drive', 'v3', credentials=creds)
-    if account_id:
-        _service_cache[account_id] = service
-    return service
+    return build('drive', 'v3', credentials=creds)
 
 # ============= RENDERERS =============
 
-async def render_explorer(event, account_id: str, folder_id: str = "root", page_token: str = None, search_query: str = None, parent_id: str = None):
+async def render_explorer(event, account_id: str, folder_id: str = "root", page_token: str = None, search_query: str = None):
     try:
         account = await db.accounts.find_one({"_id": ObjectId(account_id)})
-        # Use cached service object
-        service = get_drive_service(account['access_token'], account.get('refresh_token'), account_id=account_id)
+        service = get_drive_service(account['access_token'], account.get('refresh_token'))
+
+        query = f"'{folder_id}' in parents and trashed=false"
+        if search_query: query = "trashed=false" 
+
         enc_on = await enc(account['user_id'])
+        results = service.files().list(q=query, pageSize=100, pageToken=page_token, fields="files(id, name, mimeType, size), nextPageToken").execute()
+        raw_files = results.get('files', [])
+        next_pt = results.get('nextPageToken')
 
-        cache_key = _folder_cache_key(account_id, folder_id, page_token)
-        cached = None if search_query else _get_folder_cache(cache_key)
+        processed_files = []
+        for f in raw_files:
+            real_name = decrypt_name(f['name'], enc_on)
+            if search_query and search_query.lower() not in real_name.lower(): continue
+            processed_files.append({'id': f['id'], 'name': real_name, 'mimeType': f['mimeType'], 'size': f.get('size')})
 
-        if cached:
-            processed_files, next_pt, title = cached
-            # Filter search locally against cache — no extra API call
-        else:
-            query = f"'{folder_id}' in parents and trashed=false"
-            if search_query:
-                query = "trashed=false"
+        processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
 
-            # Fetch folder title and file list IN PARALLEL using asyncio.gather
-            loop = asyncio.get_event_loop()
-
-            def fetch_title():
-                if folder_id == "root":
-                    return None
-                try:
-                    return service.files().get(fileId=folder_id, fields='name').execute().get('name')
-                except:
-                    return None
-
-            def fetch_listing():
-                return service.files().list(
-                    q=query, pageSize=100, pageToken=page_token,
-                    fields="files(id, name, mimeType, size), nextPageToken"
-                ).execute()
-
-            folder_name_raw, results = await asyncio.gather(
-                loop.run_in_executor(_executor, fetch_title),
-                loop.run_in_executor(_executor, fetch_listing)
-            )
-
-            raw_files = results.get('files', [])
-            next_pt = results.get('nextPageToken')
-            title = decrypt_name(folder_name_raw, enc_on) if folder_name_raw else "Root"
-
-            processed_files = []
-            for f in raw_files:
-                real_name = decrypt_name(f['name'], enc_on)
-                processed_files.append({'id': f['id'], 'name': real_name, 'mimeType': f['mimeType'], 'size': f.get('size')})
-            processed_files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
-
-            # Store in cache (only non-search results)
-            if not search_query:
-                _set_folder_cache(cache_key, processed_files, next_pt, title)
-
-            # Prefetch top 3 subfolders in the background so navigating into them is instant
-            if not search_query and not page_token:
-                subfolders = [f for f in processed_files if f['mimeType'] == 'application/vnd.google-apps.folder'][:3]
-                for sf in subfolders:
-                    sf_key = _folder_cache_key(account_id, sf['id'])
-                    if not _get_folder_cache(sf_key):
-                        asyncio.create_task(_prefetch_folder(service, account_id, sf['id'], enc_on))
-
-        # Apply search filter locally (works on both cached and fresh results)
-        display_files = processed_files
-        if search_query:
-            display_files = [f for f in processed_files if search_query.lower() in f['name'].lower()]
-
+        title = "Root"
+        if folder_id != "root":
+            try:
+                meta = service.files().get(fileId=folder_id, fields='name').execute()
+                title = decrypt_name(meta.get('name'), enc_on)
+            except: pass
+        
         text = f"<b>{escape_html(title)}</b>\nAccount: <code>{escape_html(account.get('email', 'Unknown'))}</code>\n━━━━━━━━━━━━━━━━━━\n"
-        if not display_files: text += "<i>Empty folder.</i>"
+        if not processed_files: text += "<i>Empty folder.</i>"
 
         keyboard = []
-        for f in [x for x in display_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
+        for f in [x for x in processed_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
             h = await store_file_data(account_id, f['id'], folder_id)
             keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
-        files_list = [x for x in display_files if x['mimeType'] != 'application/vnd.google-apps.folder']
+        files_list = [x for x in processed_files if x['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(files_list), 2):
             row = []
             for f in files_list[i:i+2]:
@@ -245,10 +164,7 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
 
         controls = []
         if not search_query:
-            if folder_id != "root":
-                back_target = parent_id if parent_id and parent_id != folder_id else "root"
-                back_h = await store_file_data(account_id, back_target, back_target)
-                controls.append(InlineKeyboardButton(text="← Back", callback_data=f"back:{back_h}"))
+            if folder_id != "root": controls.append(InlineKeyboardButton(text="← Back", callback_data="go_root"))
             controls.append(InlineKeyboardButton(text="Batch Upload", callback_data=f"batch_up:{folder_id}"))
             controls.append(InlineKeyboardButton(text="+ New Folder", callback_data=f"mkdir:{folder_id}"))
             controls.append(InlineKeyboardButton(text="↑ Upload", callback_data=f"up:{folder_id}"))
@@ -265,39 +181,6 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         err_msg = "Error fetching files."
         if isinstance(event, CallbackQuery): await event.answer(err_msg)
         else: await event.answer(err_msg)
-
-
-async def _prefetch_folder(service, account_id: str, folder_id: str, enc_on: bool):
-    """Background task: silently fetch and cache a subfolder's contents."""
-    try:
-        cache_key = _folder_cache_key(account_id, folder_id)
-        if _get_folder_cache(cache_key):
-            return  # Already cached by the time we get here
-
-        def do_fetch():
-            results = service.files().list(
-                q=f"'{folder_id}' in parents and trashed=false",
-                pageSize=100,
-                fields="files(id, name, mimeType, size), nextPageToken"
-            ).execute()
-            title_raw = None
-            try:
-                title_raw = service.files().get(fileId=folder_id, fields='name').execute().get('name')
-            except:
-                pass
-            return results, title_raw
-
-        results, title_raw = await asyncio.get_event_loop().run_in_executor(_executor, do_fetch)
-        title = decrypt_name(title_raw, enc_on) if title_raw else "Folder"
-        next_pt = results.get('nextPageToken')
-        files = []
-        for f in results.get('files', []):
-            files.append({'id': f['id'], 'name': decrypt_name(f['name'], enc_on), 'mimeType': f['mimeType'], 'size': f.get('size')})
-        files.sort(key=lambda x: (x['mimeType'] != 'application/vnd.google-apps.folder', x['name'].lower()))
-        _set_folder_cache(cache_key, files, next_pt, title)
-        logger.debug(f"Prefetched folder {folder_id} ({len(files)} items)")
-    except Exception as e:
-        logger.debug(f"Prefetch failed for {folder_id}: {e}")
 
 async def render_file_info(callback: CallbackQuery, h: str):
     f_data = await db.callback_data.find_one({"hash": h})
@@ -557,24 +440,12 @@ async def handle_callback(callback: CallbackQuery):
     if data.startswith("open:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
-        # FIX: pass parent_id so the back button in the subfolder knows where to return
-        if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'], parent_id=f_data['parent_id'])
-
-    elif data.startswith("back:"):
-        # FIX: proper back navigation using stored parent_id
-        h = data.split(":")[1]
-        f_data = await db.callback_data.find_one({"hash": h})
-        if f_data:
-            target_id = f_data['file_id']
-            # We need the parent of the target to render back correctly
-            parent_data = await db.callback_data.find_one({"account_id": f_data['account_id'], "file_id": target_id})
-            grandparent = parent_data['parent_id'] if parent_data else "root"
-            await render_explorer(callback, f_data['account_id'], target_id, parent_id=grandparent)
+        if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'])
 
     elif data.startswith("page:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
-        if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'], f_data['next_token'], parent_id=f_data['parent_id'])
+        if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'], f_data['next_token'])
 
     elif data.startswith("info:"):
         await render_file_info(callback, data.split(":")[1])
@@ -589,11 +460,7 @@ async def handle_callback(callback: CallbackQuery):
         f_data = await db.callback_data.find_one({"hash": h})
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
         try:
-            svc = get_drive_service(acc['access_token'], acc.get('refresh_token'), account_id=f_data['account_id'])
-            await asyncio.get_event_loop().run_in_executor(
-                _executor, lambda: svc.files().delete(fileId=f_data['file_id']).execute()
-            )
-            _invalidate_folder_cache(f_data['account_id'], f_data['parent_id'])
+            get_drive_service(acc['access_token'], acc.get('refresh_token')).files().delete(fileId=f_data['file_id']).execute()
             await callback.answer("Deleted successfully")
             await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
         except Exception as e:
@@ -603,33 +470,28 @@ async def handle_callback(callback: CallbackQuery):
         h = data.split(":")[1]
         await render_file_info(callback, h)
 
-    # Download - run in executor, use cached service
+    # [FIX] Download stream correctly
     elif data.startswith("down:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
         acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
-        service = get_drive_service(acc['access_token'], acc.get('refresh_token'), account_id=f_data['account_id'])
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
         enc_on = await enc(acc['user_id'])
-
-        def fetch_meta_and_download():
-            f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
-            file_size = int(f_meta.get('size', 0))
-            if file_size > MAX_DOWNLOAD_SIZE:
-                return None, None, file_size
-            request = service.files().get_media(fileId=f_data['file_id'])
-            file_io = io.BytesIO()
-            downloader = MediaIoBaseDownload(file_io, request)
-            done = False
-            while not done: _, done = downloader.next_chunk()
-            file_io.seek(0)
-            return f_meta['name'], file_io.read(), file_size
-
-        raw_name, file_bytes, file_size = await asyncio.get_event_loop().run_in_executor(_executor, fetch_meta_and_download)
-        if file_bytes is None:
+        f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
+        real_name = decrypt_name(f_meta['name'], enc_on)
+        
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
             return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
-        real_name = decrypt_name(raw_name, enc_on)
+        
         await callback.answer("Downloading...", show_alert=False)
-        decrypted_bytes = decrypt_data(file_bytes, enc_on)
+        request = service.files().get_media(fileId=f_data['file_id'])
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        file_io.seek(0)
+        decrypted_bytes = decrypt_data(file_io.read(), enc_on)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("down_dec:"):
@@ -655,19 +517,11 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("ren:"):
-        # FIX: store state under telegram_id (not internal user_id) to match handle_user_input lookup
-        user_states[telegram_id] = {"action": "rename", "hash": data.split(":")[1]}
+        user_states[user_id] = {"action": "rename", "hash": data.split(":")[1]}
         await callback.message.answer("Enter new name:")
 
     elif data.startswith("mkdir:"):
-        # FIX: store state under telegram_id (not internal user_id) to match handle_user_input lookup
-        # Also store account_id so we can navigate back to the right account after creation
-        acc = await db.accounts.find_one({"user_id": user_id, "is_default": True}) or await db.accounts.find_one({"user_id": user_id})
-        user_states[telegram_id] = {
-            "action": "create_folder",
-            "parent_id": data.split(":")[1],
-            "account_id": str(acc['_id']) if acc else None
-        }
+        user_states[user_id] = {"action": "create_folder", "parent_id": data.split(":")[1]}
         await callback.message.answer("Enter Folder Name:")
 
     elif data.startswith("up:"):
@@ -694,11 +548,7 @@ async def handle_callback(callback: CallbackQuery):
     elif data.startswith("open_parent:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
-        if f_data:
-            # FIX: look up the grandparent so back button works from the parent folder too
-            parent_data = await db.callback_data.find_one({"account_id": f_data['account_id'], "file_id": f_data['parent_id']})
-            grandparent = parent_data['parent_id'] if parent_data else "root"
-            await render_explorer(callback, f_data['account_id'], f_data['parent_id'], parent_id=grandparent)
+        await render_explorer(callback, f_data['account_id'], f_data['parent_id'])
 
     elif data == "go_root":
         acc = await db.accounts.find_one({"user_id": user_id, "is_default": True})
@@ -845,196 +695,82 @@ async def handle_user_input(message: Message):
     elif state['action'] == "rename":
         f_data = await db.callback_data.find_one({"hash": state['hash']})
         enc_on = await enc(user_id)
-        new_enc_name = encrypt_name(message.text, enc_on)
-        await asyncio.get_event_loop().run_in_executor(
-            _executor,
-            lambda: service.files().update(fileId=f_data['file_id'], body={'name': new_enc_name}).execute()
-        )
-        _invalidate_folder_cache(f_data['account_id'], f_data['parent_id'])
+        service.files().update(fileId=f_data['file_id'], body={'name': encrypt_name(message.text, enc_on)}).execute()
         await message.answer("Renamed successfully")
         del user_states[telegram_id]
         await render_explorer(message, f_data['account_id'], f_data['parent_id'])
 
     elif state['action'] == "create_folder":
         enc_on = await enc(user_id)
-        folder_name = message.text.strip()
-        if not folder_name:
-            return await message.answer("❌ Folder name cannot be empty. Please try again.")
-        parent_id = state['parent_id']
-        account_id = state.get('account_id') or str(acc['_id'])
-        meta = {
-            'name': encrypt_name(folder_name, enc_on),
-            'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [parent_id] if parent_id != "root" else []
-        }
-        await asyncio.get_event_loop().run_in_executor(
-            _executor,
-            lambda: service.files().create(body=meta).execute()
-        )
-        _invalidate_folder_cache(account_id, parent_id)
-        await message.answer(f"✅ Folder <b>{escape_html(folder_name)}</b> created successfully", parse_mode="HTML")
+        meta = {'name': encrypt_name(message.text, enc_on), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+        service.files().create(body=meta).execute()
+        await message.answer("Folder created successfully")
         del user_states[telegram_id]
-        await render_explorer(message, account_id, parent_id)
+        await render_explorer(message, str(acc['_id']), state['parent_id'])
 
-    # ============= UPLOAD =============
+    # [FIX] Upload stream directly to MediaIoBaseUpload
     elif state['action'] in ["upload_file", "batch_upload"]:
-        # Detect file type and extract file_obj + filename
-        file_obj = None
-        filename = None
-        if message.document:
-            file_obj = message.document
-            filename = message.document.file_name
-        elif message.video:
-            file_obj = message.video
-            filename = message.video.file_name or f"video_{message.message_id}.mp4"
-        elif message.audio:
-            file_obj = message.audio
-            filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
-        elif message.photo:
-            file_obj = message.photo[-1]
-            filename = f"photo_{message.message_id}.jpg"
-        elif message.voice:
-            file_obj = message.voice
-            filename = f"voice_{message.message_id}.ogg"
-        elif message.animation:
-            file_obj = message.animation
-            filename = message.animation.file_name or f"animation_{message.message_id}.gif"
-        elif message.video_note:
-            file_obj = message.video_note
-            filename = f"video_note_{message.message_id}.mp4"
-        elif message.sticker:
-            file_obj = message.sticker
-            filename = f"sticker_{message.message_id}.webp"
+        file_obj = None; filename = "untitled"
+        if message.document: file_obj = message.document; filename = message.document.file_name
+        elif message.video: file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"
+        elif message.audio: file_obj = message.audio; filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
+        elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
-        if not file_obj:
-            return await message.answer(
-                "❌ Unsupported file type. Send a document, photo, video, audio, voice message, or animation."
-            )
+        if file_obj:
+            if file_obj.file_size > MAX_UPLOAD_SIZE:
+                return await message.answer(f"File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
 
-        # Sanitize filename
-        if not filename:
-            filename = f"file_{message.message_id}"
-        filename = filename.strip() or f"file_{message.message_id}"
-
-        # Size check — file_size can be None for large files on local server (that's fine, let it through)
-        file_size = getattr(file_obj, 'file_size', None) or 0
-        if file_size and file_size > MAX_UPLOAD_SIZE:
-            return await message.answer(
-                f"❌ File too big ({file_size//(1024*1024)}MB). Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB."
-            )
-
-        msg = await message.reply(f"⏳ Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
-        try:
-            logger.info(f"Upload started: {filename} ({file_size} bytes) local_server={USE_LOCAL_SERVER}")
-
-            import aiohttp as _aiohttp
-
-            async def download_file_bytes(file_id: str, size: int) -> bytes:
-                """
-                Download a file from Telegram, handling large files correctly.
-                Strategy:
-                  1. If local server: try getFile on local server (works if local server stored it)
-                  2. If local server getFile fails OR standard API: use bot.download() for <=20MB
-                  3. For large files on standard API: raise a clear error (need local server or MTProto)
-                """
-                async with _aiohttp.ClientSession() as _http:
-                    if USE_LOCAL_SERVER:
-                        # Try local server getFile first
-                        getfile_url = f"{LOCAL_SERVER_URL}/bot{BOT_TOKEN}/getFile?file_id={file_id}"
-                        logger.info(f"Trying local server getFile: {getfile_url}")
-                        async with _http.get(getfile_url) as resp:
-                            if resp.status == 200:
-                                result = await resp.json(content_type=None)
-                                if result.get("ok"):
-                                    file_path = result["result"]["file_path"]
-                                    file_url = f"{LOCAL_SERVER_URL}/file/bot{BOT_TOKEN}/{file_path}"
-                                    logger.info(f"Local server has file, downloading: {file_url}")
-                                    async with _http.get(file_url) as dl:
-                                        if dl.status == 200:
-                                            return await dl.read()
-                            # Local server doesn't have it — log and fall through
-                            body = await resp.text()
-                            logger.warning(f"Local server getFile returned {resp.status}: {body[:200]}")
-                            logger.warning("File not on local server. This means either:")
-                            logger.warning("  1. Local server wasn't running when file was sent")
-                            logger.warning("  2. Local server not started with --local flag")
-                            logger.warning("  3. File too large for local server config")
-
-                # Fall back to standard Telegram API (only works <=20MB)
-                if size and size > 20 * 1024 * 1024:
-                    raise Exception(
-                        f"File is {size//(1024*1024)}MB. Local server couldn't serve it.\n\n"
-                        f"Make sure your Telegram local server is started with the --local flag "
-                        f"and was running when this file was sent."
-                    )
-                file_io = await bot.download(file_id)
-                return file_io.read()
-
-            file_bytes = await download_file_bytes(file_obj.file_id, file_size)
-
-            logger.info(f"Downloaded {len(file_bytes)} bytes, encrypting...")
-
-            enc_on = await enc(user_id)
-            enc_bytes = encrypt_data(file_bytes, enc_on)
-            enc_name = encrypt_name(filename, enc_on)
-            meta = {
-                'name': enc_name,
-                'parents': [state['parent_id']] if state['parent_id'] != "root" else []
-            }
-
-            def do_upload():
+            msg = await message.reply(f"Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+            try:
+                file_io = await bot.download(file_obj)
+                file_bytes = file_io.read()
+                enc_on = await enc(user_id)
+                enc_bytes = encrypt_data(file_bytes, enc_on)
+                enc_name = encrypt_name(filename, enc_on)
+                meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
+                
+                # Upload logic 
                 media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                 service.files().create(body=meta, media_body=media).execute()
-
-            await asyncio.get_event_loop().run_in_executor(_executor, do_upload)
-            _invalidate_folder_cache(str(acc['_id']), state['parent_id'])
-            logger.info(f"Upload complete: {filename}")
-
-            # Backup logic
-            if await db.is_backup_enabled(user_id):
-                backup_acc = await db.get_backup_account(user_id)
-                if backup_acc:
-                    try:
-                        def do_backup():
+                
+                # Backup logic 
+                if await db.is_backup_enabled(user_id):
+                    backup_acc = await db.get_backup_account(user_id)
+                    if backup_acc:
+                        try:
                             backup_service = get_drive_service(backup_acc['access_token'], backup_acc.get('refresh_token'))
                             backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                             backup_service.files().create(body=meta, media_body=backup_media).execute()
-                        await asyncio.get_event_loop().run_in_executor(_executor, do_backup)
-                        await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded (+ backup copy)", parse_mode="HTML")
-                    except Exception as backup_error:
-                        logger.error(f"Backup upload failed: {backup_error}")
-                        await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded (backup failed)", parse_mode="HTML")
-                else:
-                    await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded successfully", parse_mode="HTML")
-            else:
-                await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded successfully", parse_mode="HTML")
-
-            if state['action'] == "upload_file":
-                del user_states[telegram_id]
-                await render_explorer(message, str(acc['_id']), state['parent_id'])
-
-        except Exception as e:
-            logger.error(f"Upload Error for {filename}: {e}", exc_info=True)
-            try:
-                await msg.edit_text(f"❌ Upload failed: <code>{escape_html(str(e))}</code>", parse_mode="HTML")
-            except Exception:
-                await message.answer(f"❌ Upload failed: <code>{escape_html(str(e))}</code>", parse_mode="HTML")
+                            await msg.edit_text("Uploaded successfully (+ backup copy)")
+                        except Exception as backup_error:
+                            logger.error(f"Backup upload failed: {backup_error}")
+                            await msg.edit_text("Uploaded successfully (backup failed)")
+                    else: await msg.edit_text("Uploaded successfully")
+                else: await msg.edit_text("Uploaded successfully")
+                
+                # Only clear state if it is SINGLE upload
+                if state['action'] == "upload_file":
+                    del user_states[telegram_id]
+                    await render_explorer(message, str(acc['_id']), state['parent_id'])
+                
+            except Exception as e:
+                await msg.edit_text(f"Error: {e}")
 
 # ============= MAIN =============
 
 async def main():
     global bot, db, dp
     
-    # === LOCAL SERVER LOGIC ===
+    # === LOCAL SERVER LOGIC ADDED HERE ===
     if USE_LOCAL_SERVER:
         session = AiohttpSession(
             api=TelegramAPIServer.from_base(LOCAL_SERVER_URL, is_local=True)
         )
         bot = Bot(token=BOT_TOKEN, session=session)
-        logger.info(f"✅ Bot initialized using LOCAL SERVER: {LOCAL_SERVER_URL} — upload limit: {MAX_UPLOAD_SIZE//(1024*1024)}MB")
+        logger.info(f"Bot initialized using Local Server: {LOCAL_SERVER_URL}")
     else:
         bot = Bot(token=BOT_TOKEN)
-        logger.info(f"⚠️  Bot initialized using STANDARD Telegram API — upload limit: {MAX_UPLOAD_SIZE//(1024*1024)}MB")
+        logger.info("Bot initialized using Standard Telegram API")
     # =====================================
 
     db = Database()
@@ -1061,7 +797,7 @@ async def main():
     dp.message.register(cmd_add, Command("addaccount"))
     dp.message.register(cmd_logout, Command("logout"))
     
-    dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo | F.voice | F.animation | F.video_note | F.sticker)
+    dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
     if hasattr(web_module, 'setup_web_module'):
