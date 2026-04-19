@@ -21,11 +21,12 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from config import BOT_TOKEN, USE_LOCAL_SERVER, LOCAL_SERVER_URL, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
+from config import BOT_TOKEN, USE_LOCAL_SERVER, LOCAL_SERVER_URL
+
+from config import BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 import web as web_module
-import aiohttp
 
 # Logging
 logging.basicConfig(
@@ -108,35 +109,6 @@ def get_drive_service(access_token: str, refresh_token: str = None):
         'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET
     }, SCOPES)
     return build('drive', 'v3', credentials=creds)
-
-async def download_file_from_local_server(file_path: str, bot_token: str) -> io.BytesIO:
-    """
-    Download file directly from local Telegram API server via HTTP streaming.
-    This bypasses the bot.download() file size limit when using local server.
-    """
-    if not USE_LOCAL_SERVER:
-        raise ValueError("This function only works with local Telegram API server")
-    
-    # Construct direct download URL from local server
-    download_url = f"{LOCAL_SERVER_URL}/file/bot{bot_token}/{file_path}"
-    logger.info(f"[v0] Downloading from local server: {download_url}")
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(download_url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Download failed: HTTP {resp.status}")
-                
-                file_buffer = io.BytesIO()
-                async for chunk in resp.content.iter_chunked(10 * 1024 * 1024):  # 10MB chunks
-                    file_buffer.write(chunk)
-                
-                file_buffer.seek(0)
-                logger.info(f"[v0] Downloaded {len(file_buffer.getvalue())} bytes")
-                return file_buffer
-    except Exception as e:
-        logger.error(f"[v0] Local server download failed: {e}")
-        raise
 
 # ============= RENDERERS =============
 
@@ -250,7 +222,7 @@ async def render_settings(event, user_id: int):
     bot_decrypt_enabled = await db.is_bot_decrypt_enabled(user_id)
 
     enc_status_text = "🔒 ON" if enc_enabled else "🔓 OFF"
-    text = f"<b>���️ Settings</b>\n\n"
+    text = f"<b>⚙️ Settings</b>\n\n"
     text += f"<b>Encryption:</b> {enc_status_text}\n"
     if enc_enabled:
         text += "<i>Files are encrypted on upload. Downloads are auto-decrypted.</i>\n\n"
@@ -498,75 +470,51 @@ async def handle_callback(callback: CallbackQuery):
         h = data.split(":")[1]
         await render_file_info(callback, h)
 
-    # [FIX] Download stream correctly with error handling
+    # [FIX] Download stream correctly
     elif data.startswith("down:"):
-        try:
-            h = data.split(":")[1]
-            f_data = await db.callback_data.find_one({"hash": h})
-            if not f_data:
-                return await callback.answer("File data not found", show_alert=True)
-            
-            acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
-            if not acc:
-                return await callback.answer("Account not found", show_alert=True)
-            
-            service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
-            enc_on = await enc(acc['user_id'])
-            f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
-            real_name = decrypt_name(f_meta['name'], enc_on)
-            
-            file_size = int(f_meta.get('size', 0))
-            if file_size > MAX_DOWNLOAD_SIZE:
-                return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
-            
-            await callback.answer("Downloading...", show_alert=False)
-            request = service.files().get_media(fileId=f_data['file_id'])
-            file_io = io.BytesIO()
-            downloader = MediaIoBaseDownload(file_io, request, chunksize=10*1024*1024)  # 10MB chunks
-            done = False
-            while not done: 
-                _, done = downloader.next_chunk()
-            file_io.seek(0)
-            decrypted_bytes = decrypt_data(file_io.read(), enc_on)
-            await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
-            logger.info(f"Downloaded and sent: {real_name}")
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            await callback.answer(f"Download failed: {str(e)[:80]}", show_alert=True)
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        enc_on = await enc(acc['user_id'])
+        f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
+        real_name = decrypt_name(f_meta['name'], enc_on)
+        
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
+        
+        await callback.answer("Downloading...", show_alert=False)
+        request = service.files().get_media(fileId=f_data['file_id'])
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        file_io.seek(0)
+        decrypted_bytes = decrypt_data(file_io.read(), enc_on)
+        await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("down_dec:"):
-        try:
-            h = data.split(":")[1]
-            f_data = await db.callback_data.find_one({"hash": h})
-            if not f_data:
-                return await callback.answer("File data not found", show_alert=True)
-            
-            acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
-            if not acc:
-                return await callback.answer("Account not found", show_alert=True)
-            
-            service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
-            f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
-            real_name = decrypt_name(f_meta['name'], enabled=True)
-            
-            file_size = int(f_meta.get('size', 0))
-            if file_size > MAX_DOWNLOAD_SIZE:
-                return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
-            
-            await callback.answer("Decrypting & downloading...", show_alert=False)
-            request = service.files().get_media(fileId=f_data['file_id'])
-            file_io = io.BytesIO()
-            downloader = MediaIoBaseDownload(file_io, request, chunksize=10*1024*1024)  # 10MB chunks
-            done = False
-            while not done: 
-                _, done = downloader.next_chunk()
-            file_io.seek(0)
-            decrypted_bytes = decrypt_data(file_io.read(), enabled=True)
-            await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
-            logger.info(f"Downloaded and decrypted: {real_name}")
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            await callback.answer(f"Download failed: {str(e)[:80]}", show_alert=True)
+        h = data.split(":")[1]
+        f_data = await db.callback_data.find_one({"hash": h})
+        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+        f_meta = service.files().get(fileId=f_data['file_id'], fields="name, size").execute()
+        real_name = decrypt_name(f_meta['name'], enabled=True)
+        
+        file_size = int(f_meta.get('size', 0))
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return await callback.answer(f"File too big! Limit is {MAX_DOWNLOAD_SIZE//(1024*1024)}MB", show_alert=True)
+        
+        await callback.answer("Decrypting & downloading...", show_alert=False)
+        request = service.files().get_media(fileId=f_data['file_id'])
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+        file_io.seek(0)
+        decrypted_bytes = decrypt_data(file_io.read(), enabled=True)
+        await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
 
     elif data.startswith("ren:"):
         user_states[user_id] = {"action": "rename", "hash": data.split(":")[1]}
@@ -768,57 +716,37 @@ async def handle_user_input(message: Message):
         elif message.audio: file_obj = message.audio; filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
         elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
 
-        if file_obj and hasattr(file_obj, 'file_size') and file_obj.file_size:
-            # Check against actual limit
+        if file_obj:
             if file_obj.file_size > MAX_UPLOAD_SIZE:
-                limit_mb = MAX_UPLOAD_SIZE // (1024 * 1024)
-                return await message.answer(f"File too big! Limit is {limit_mb}MB")
+                return await message.answer(f"File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
 
             msg = await message.reply(f"Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             try:
-                # Download file - use direct HTTP for local server to bypass size limits
-                if USE_LOCAL_SERVER:
-                    logger.info("[v0] Using local server direct download (bypasses file size limits)")
-                    try:
-                        file_io = await download_file_from_local_server(file_obj.file_path, BOT_TOKEN)
-                    except Exception as local_error:
-                        logger.warning(f"[v0] Local download failed: {local_error}, falling back to bot.download()")
-                        file_io = await bot.download(file_obj)
-                else:
-                    file_io = await bot.download(file_obj)
-                
+                file_io = await bot.download(file_obj)
                 file_bytes = file_io.read()
                 enc_on = await enc(user_id)
                 enc_bytes = encrypt_data(file_bytes, enc_on)
                 enc_name = encrypt_name(filename, enc_on)
                 meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
                 
-                # Upload logic - use resumable upload for large files
-                try:
-                    media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream', resumable=True)
-                    file_metadata = service.files().create(body=meta, media_body=media, fields='id').execute()
-                    logger.info(f"File uploaded successfully: {file_metadata.get('id')}")
-                except Exception as upload_error:
-                    logger.error(f"Primary upload failed: {upload_error}")
-                    await msg.edit_text(f"Upload failed: {str(upload_error)[:80]}")
-                    return
+                # Upload logic 
+                media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                service.files().create(body=meta, media_body=media).execute()
                 
-                # Backup logic - only if primary upload succeeded
-                status_msg = "Uploaded successfully"
+                # Backup logic 
                 if await db.is_backup_enabled(user_id):
                     backup_acc = await db.get_backup_account(user_id)
                     if backup_acc:
                         try:
                             backup_service = get_drive_service(backup_acc['access_token'], backup_acc.get('refresh_token'))
-                            backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream', resumable=True)
-                            backup_service.files().create(body=meta, media_body=backup_media, fields='id').execute()
-                            status_msg = "Uploaded successfully (+ backup copy)"
-                            logger.info("Backup upload succeeded")
+                            backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                            backup_service.files().create(body=meta, media_body=backup_media).execute()
+                            await msg.edit_text("Uploaded successfully (+ backup copy)")
                         except Exception as backup_error:
                             logger.error(f"Backup upload failed: {backup_error}")
-                            status_msg = "Uploaded (backup failed - will retry later)"
-                
-                await msg.edit_text(status_msg)
+                            await msg.edit_text("Uploaded successfully (backup failed)")
+                    else: await msg.edit_text("Uploaded successfully")
+                else: await msg.edit_text("Uploaded successfully")
                 
                 # Only clear state if it is SINGLE upload
                 if state['action'] == "upload_file":
@@ -826,18 +754,7 @@ async def handle_user_input(message: Message):
                     await render_explorer(message, str(acc['_id']), state['parent_id'])
                 
             except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Upload error: {error_msg}", exc_info=True)
-                
-                # Provide helpful error messages
-                if "Request entity too large" in error_msg or "413" in error_msg:
-                    await msg.edit_text("File too large to upload. Try a smaller file.")
-                elif "quota" in error_msg.lower():
-                    await msg.edit_text("Google Drive quota exceeded. Try later.")
-                elif "authentication" in error_msg.lower() or "401" in error_msg:
-                    await msg.edit_text("Authentication failed. Try reconnecting your account.")
-                else:
-                    await msg.edit_text(f"Upload failed: {error_msg[:100]}")
+                await msg.edit_text(f"Error: {e}")
 
 # ============= MAIN =============
 
@@ -888,17 +805,8 @@ async def main():
         app = web_module.create_web_app()
         runner = web.AppRunner(app)
         await runner.setup()
-        
-        # Log the web server configuration for debugging
-        logger.info(f"Web server config:")
-        logger.info(f"  - PORT: {PORT}")
-        logger.info(f"  - REDIRECT_URI: {REDIRECT_URI}")
-        logger.info(f"  - USE_LOCAL_SERVER: {USE_LOCAL_SERVER}")
-        if USE_LOCAL_SERVER:
-            logger.info(f"  - LOCAL_SERVER_URL: {LOCAL_SERVER_URL}")
-        
         await web.TCPSite(runner, '0.0.0.0', PORT).start()
-        logger.info(f"Web server started on http://0.0.0.0:{PORT} (accessible at {REDIRECT_URI.rsplit('/', 1)[0]})")
+        logger.info(f"Web server started on port {PORT}")
     
     logger.info("Bot is running...")
     await dp.start_polling(bot)
