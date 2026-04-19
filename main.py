@@ -929,33 +929,48 @@ async def handle_user_input(message: Message):
 
             import aiohttp as _aiohttp
 
-            # Download from Telegram
-            if USE_LOCAL_SERVER:
-                # CRITICAL: bot.get_file() in aiogram hits the standard Telegram API even when
-                # a local server session is configured — so it rejects files >20MB.
-                # Fix: call getFile directly on the local server URL via raw HTTP, then fetch the file.
+            async def download_file_bytes(file_id: str, size: int) -> bytes:
+                """
+                Download a file from Telegram, handling large files correctly.
+                Strategy:
+                  1. If local server: try getFile on local server (works if local server stored it)
+                  2. If local server getFile fails OR standard API: use bot.download() for <=20MB
+                  3. For large files on standard API: raise a clear error (need local server or MTProto)
+                """
                 async with _aiohttp.ClientSession() as _http:
-                    # Step 1: getFile via local server
-                    getfile_url = f"{LOCAL_SERVER_URL}/bot{BOT_TOKEN}/getFile?file_id={file_obj.file_id}"
-                    logger.info(f"Calling getFile on local server: {getfile_url}")
-                    async with _http.get(getfile_url) as resp:
-                        if resp.status != 200:
-                            raise Exception(f"getFile failed with HTTP {resp.status}")
-                        result = await resp.json()
-                        if not result.get("ok"):
-                            raise Exception(f"getFile error: {result.get('description')}")
-                        file_path = result["result"]["file_path"]
+                    if USE_LOCAL_SERVER:
+                        # Try local server getFile first
+                        getfile_url = f"{LOCAL_SERVER_URL}/bot{BOT_TOKEN}/getFile?file_id={file_id}"
+                        logger.info(f"Trying local server getFile: {getfile_url}")
+                        async with _http.get(getfile_url) as resp:
+                            if resp.status == 200:
+                                result = await resp.json(content_type=None)
+                                if result.get("ok"):
+                                    file_path = result["result"]["file_path"]
+                                    file_url = f"{LOCAL_SERVER_URL}/file/bot{BOT_TOKEN}/{file_path}"
+                                    logger.info(f"Local server has file, downloading: {file_url}")
+                                    async with _http.get(file_url) as dl:
+                                        if dl.status == 200:
+                                            return await dl.read()
+                            # Local server doesn't have it — log and fall through
+                            body = await resp.text()
+                            logger.warning(f"Local server getFile returned {resp.status}: {body[:200]}")
+                            logger.warning("File not on local server. This means either:")
+                            logger.warning("  1. Local server wasn't running when file was sent")
+                            logger.warning("  2. Local server not started with --local flag")
+                            logger.warning("  3. File too large for local server config")
 
-                    # Step 2: download file bytes from local server
-                    file_url = f"{LOCAL_SERVER_URL}/file/bot{BOT_TOKEN}/{file_path}"
-                    logger.info(f"Downloading from local server: {file_url}")
-                    async with _http.get(file_url) as resp:
-                        if resp.status != 200:
-                            raise Exception(f"File download failed with HTTP {resp.status}")
-                        file_bytes = await resp.read()
-            else:
-                file_io = await bot.download(file_obj)
-                file_bytes = file_io.read()
+                # Fall back to standard Telegram API (only works <=20MB)
+                if size and size > 20 * 1024 * 1024:
+                    raise Exception(
+                        f"File is {size//(1024*1024)}MB. Local server couldn't serve it.\n\n"
+                        f"Make sure your Telegram local server is started with the --local flag "
+                        f"and was running when this file was sent."
+                    )
+                file_io = await bot.download(file_id)
+                return file_io.read()
+
+            file_bytes = await download_file_bytes(file_obj.file_id, file_size)
 
             logger.info(f"Downloaded {len(file_bytes)} bytes, encrypting...")
 
