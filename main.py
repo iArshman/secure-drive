@@ -876,71 +876,120 @@ async def handle_user_input(message: Message):
         del user_states[telegram_id]
         await render_explorer(message, account_id, parent_id)
 
-    # [FIX] Upload: run blocking Drive calls in executor to avoid blocking event loop
+    # ============= UPLOAD =============
     elif state['action'] in ["upload_file", "batch_upload"]:
-        file_obj = None; filename = "untitled"
-        if message.document: file_obj = message.document; filename = message.document.file_name
-        elif message.video: file_obj = message.video; filename = message.video.file_name or f"video_{message.message_id}.mp4"
-        elif message.audio: file_obj = message.audio; filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
-        elif message.photo: file_obj = message.photo[-1]; filename = f"photo_{message.message_id}.jpg"
+        # Detect file type and extract file_obj + filename
+        file_obj = None
+        filename = None
+        if message.document:
+            file_obj = message.document
+            filename = message.document.file_name
+        elif message.video:
+            file_obj = message.video
+            filename = message.video.file_name or f"video_{message.message_id}.mp4"
+        elif message.audio:
+            file_obj = message.audio
+            filename = message.audio.file_name or f"audio_{message.message_id}.mp3"
+        elif message.photo:
+            file_obj = message.photo[-1]
+            filename = f"photo_{message.message_id}.jpg"
+        elif message.voice:
+            file_obj = message.voice
+            filename = f"voice_{message.message_id}.ogg"
+        elif message.animation:
+            file_obj = message.animation
+            filename = message.animation.file_name or f"animation_{message.message_id}.gif"
+        elif message.video_note:
+            file_obj = message.video_note
+            filename = f"video_note_{message.message_id}.mp4"
+        elif message.sticker:
+            file_obj = message.sticker
+            filename = f"sticker_{message.message_id}.webp"
 
-        if file_obj:
-            file_size = getattr(file_obj, 'file_size', None) or 0
-            if file_size and file_size > MAX_UPLOAD_SIZE:
-                return await message.answer(f"File too big! Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB")
+        if not file_obj:
+            return await message.answer(
+                "❌ Unsupported file type. Send a document, photo, video, audio, voice message, or animation."
+            )
 
-            msg = await message.reply(f"Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
-            try:
-                # On local server, bot.download() still uses getFile which fails >20MB.
-                # Use get_file + direct URL download instead so local server's 2GB limit applies.
+        # Sanitize filename
+        if not filename:
+            filename = f"file_{message.message_id}"
+        filename = filename.strip() or f"file_{message.message_id}"
+
+        # Size check — file_size can be None for large files on local server (that's fine, let it through)
+        file_size = getattr(file_obj, 'file_size', None) or 0
+        if file_size and file_size > MAX_UPLOAD_SIZE:
+            return await message.answer(
+                f"❌ File too big ({file_size//(1024*1024)}MB). Limit is {MAX_UPLOAD_SIZE//(1024*1024)}MB."
+            )
+
+        msg = await message.reply(f"⏳ Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
+        try:
+            logger.info(f"Upload started: {filename} ({file_size} bytes) local_server={USE_LOCAL_SERVER}")
+
+            # Download from Telegram
+            if USE_LOCAL_SERVER:
+                # bot.download() routes through standard API even on local server — use direct HTTP instead
                 tg_file = await bot.get_file(file_obj.file_id)
-                if USE_LOCAL_SERVER:
-                    # Local server exposes files directly at /file/bot{token}/{file_path}
-                    file_url = f"{LOCAL_SERVER_URL}/file/bot{BOT_TOKEN}/{tg_file.file_path}"
-                    import aiohttp as _aiohttp
-                    async with _aiohttp.ClientSession() as session_http:
-                        async with session_http.get(file_url) as resp:
-                            file_bytes = await resp.read()
-                else:
-                    file_io = await bot.download(file_obj)
-                    file_bytes = file_io.read()
+                file_url = f"{LOCAL_SERVER_URL}/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+                logger.info(f"Fetching from local server: {file_url}")
+                import aiohttp as _aiohttp
+                async with _aiohttp.ClientSession() as _http:
+                    async with _http.get(file_url) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"Local server returned HTTP {resp.status} for file download")
+                        file_bytes = await resp.read()
+            else:
+                file_io = await bot.download(file_obj)
+                file_bytes = file_io.read()
 
-                enc_on = await enc(user_id)
-                enc_bytes = encrypt_data(file_bytes, enc_on)
-                enc_name = encrypt_name(filename, enc_on)
-                meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
-                
-                # FIX: run blocking upload in executor
-                def do_upload():
-                    media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
-                    service.files().create(body=meta, media_body=media).execute()
-                await asyncio.get_event_loop().run_in_executor(_executor, do_upload)
-                _invalidate_folder_cache(str(acc['_id']), state['parent_id'])
-                
-                # Backup logic
-                if await db.is_backup_enabled(user_id):
-                    backup_acc = await db.get_backup_account(user_id)
-                    if backup_acc:
-                        try:
-                            def do_backup():
-                                backup_service = get_drive_service(backup_acc['access_token'], backup_acc.get('refresh_token'))
-                                backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
-                                backup_service.files().create(body=meta, media_body=backup_media).execute()
-                            await asyncio.get_event_loop().run_in_executor(_executor, do_backup)
-                            await msg.edit_text("Uploaded successfully (+ backup copy)")
-                        except Exception as backup_error:
-                            logger.error(f"Backup upload failed: {backup_error}")
-                            await msg.edit_text("Uploaded successfully (backup failed)")
-                    else: await msg.edit_text("Uploaded successfully")
-                else: await msg.edit_text("Uploaded successfully")
-                
-                # Only clear state if it is SINGLE upload
-                if state['action'] == "upload_file":
-                    del user_states[telegram_id]
-                    await render_explorer(message, str(acc['_id']), state['parent_id'])
-                
-            except Exception as e:
-                await msg.edit_text(f"Error: {e}")
+            logger.info(f"Downloaded {len(file_bytes)} bytes, encrypting...")
+
+            enc_on = await enc(user_id)
+            enc_bytes = encrypt_data(file_bytes, enc_on)
+            enc_name = encrypt_name(filename, enc_on)
+            meta = {
+                'name': enc_name,
+                'parents': [state['parent_id']] if state['parent_id'] != "root" else []
+            }
+
+            def do_upload():
+                media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                service.files().create(body=meta, media_body=media).execute()
+
+            await asyncio.get_event_loop().run_in_executor(_executor, do_upload)
+            _invalidate_folder_cache(str(acc['_id']), state['parent_id'])
+            logger.info(f"Upload complete: {filename}")
+
+            # Backup logic
+            if await db.is_backup_enabled(user_id):
+                backup_acc = await db.get_backup_account(user_id)
+                if backup_acc:
+                    try:
+                        def do_backup():
+                            backup_service = get_drive_service(backup_acc['access_token'], backup_acc.get('refresh_token'))
+                            backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
+                            backup_service.files().create(body=meta, media_body=backup_media).execute()
+                        await asyncio.get_event_loop().run_in_executor(_executor, do_backup)
+                        await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded (+ backup copy)", parse_mode="HTML")
+                    except Exception as backup_error:
+                        logger.error(f"Backup upload failed: {backup_error}")
+                        await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded (backup failed)", parse_mode="HTML")
+                else:
+                    await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded successfully", parse_mode="HTML")
+            else:
+                await msg.edit_text(f"✅ <b>{escape_html(filename)}</b> uploaded successfully", parse_mode="HTML")
+
+            if state['action'] == "upload_file":
+                del user_states[telegram_id]
+                await render_explorer(message, str(acc['_id']), state['parent_id'])
+
+        except Exception as e:
+            logger.error(f"Upload Error for {filename}: {e}", exc_info=True)
+            try:
+                await msg.edit_text(f"❌ Upload failed: <code>{escape_html(str(e))}</code>", parse_mode="HTML")
+            except Exception:
+                await message.answer(f"❌ Upload failed: <code>{escape_html(str(e))}</code>", parse_mode="HTML")
 
 # ============= MAIN =============
 
@@ -983,7 +1032,7 @@ async def main():
     dp.message.register(cmd_add, Command("addaccount"))
     dp.message.register(cmd_logout, Command("logout"))
     
-    dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
+    dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo | F.voice | F.animation | F.video_note | F.sticker)
     dp.callback_query.register(handle_callback)
     
     if hasattr(web_module, 'setup_web_module'):
