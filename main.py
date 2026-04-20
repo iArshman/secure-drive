@@ -149,21 +149,24 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
 
         keyboard = []
         for f in [x for x in processed_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
-            h = await store_file_data(account_id, f['id'], folder_id)
+            # Pass account['user_id'] here
+            h = await store_file_data(account['user_id'], account_id, f['id'], folder_id)
             keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
         files_list = [x for x in processed_files if x['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(files_list), 2):
             row = []
             for f in files_list[i:i+2]:
-                h = await store_file_data(account_id, f['id'], folder_id)
+                # Pass account['user_id'] here
+                h = await store_file_data(account['user_id'], account_id, f['id'], folder_id)
                 btn_text = get_file_view(f['mimeType'], f['name'])
                 if len(btn_text) > 20: btn_text = btn_text[:20] + ".."
                 row.append(InlineKeyboardButton(text=btn_text, callback_data=f"info:{h}"))
             keyboard.append(row)
 
         if next_pt:
-            nh = await store_file_data(account_id, folder_id, folder_id, next_pt)
+            # Pass account['user_id'] here
+            nh = await store_file_data(account['user_id'], account_id, folder_id, folder_id, next_pt)
             keyboard.append([InlineKeyboardButton(text="Next Page", callback_data=f"page:{nh}")])
 
         controls = []
