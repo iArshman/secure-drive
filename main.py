@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 from bson import ObjectId
 
+import base64
+import json
+from config import OAUTH_BRIDGE_URL, BOT_WEBHOOK_URL
+
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, BotCommand
@@ -41,6 +46,8 @@ db: Optional[Database] = None
 dp: Optional[Dispatcher] = None
 oauth_states: Dict[str, dict] = {}
 user_states: Dict[int, dict] = {}
+
+
 
 # ============= MENU SETUP =============
 
@@ -375,26 +382,25 @@ async def cmd_add(message: Message):
     if not internal_id:
         return await message.answer("Please login first using /start")
 
-    state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token"
-            }
-        },
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
-    )
-
-    auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=state_key)
-    oauth_states[state_key] = {"user_id": internal_id, "telegram_id": message.from_user.id, "flow": flow}
+    # 1. Prepare the state for the bridge
+    state_obj = {
+        "u": str(internal_id),         # Internal User ID
+        "r": BOT_WEBHOOK_URL,          # Where bridge should send tokens
+        "x": str(message.from_user.id) # Extra: Telegram ID for notification
+    }
+    
+    # 2. Encode to Base64
+    state_b64 = base64.urlsafe_b64encode(json.dumps(state_obj).encode()).decode().rstrip("=")
+    
+    # 3. Create bridge URL
+    auth_url = f"{OAUTH_BRIDGE_URL}/start-auth?state={state_b64}"
 
     await message.answer(
-        "Link Account:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]])
+        "<b>Link Google Drive Account</b>\nClick below to authorize via our secure bridge:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Connect Google Drive", url=auth_url)
+        ]]),
+        parse_mode="HTML"
     )
  
 async def cmd_logout(message: Message):
