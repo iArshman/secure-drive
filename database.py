@@ -43,22 +43,6 @@ class Database:
             })
             return new_key
     
-    def _hash_password(self, password: str, salt: bytes = None) -> tuple[str, str]:
-        """Returns (hashed_hex, salt_hex). If salt is None, a new one is generated."""
-        if salt is None:
-            salt = os.urandom(16)
-        dk = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
-        return dk.hex(), salt.hex()
-
-    def _verify_password(self, password: str, stored_hash: str, stored_salt: str = None) -> bool:
-        """Verify password against stored hash. Handles both legacy SHA-256 and new scrypt."""
-        if stored_salt is None:
-            # Legacy SHA-256 path (no salt)
-            return hashlib.sha256(password.encode()).hexdigest() == stored_hash
-        salt = bytes.fromhex(stored_salt)
-        dk = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
-        return dk.hex() == stored_hash
-    
     async def register_user(self, telegram_id: int, username: str, password: str, full_name: str = None) -> dict:
         username_taken = await self.auth_users.find_one({'username': username})
         if username_taken:
@@ -69,15 +53,12 @@ class Database:
             {'$set': {'is_logged_in': False}}
         )
         
-        # Fixed: Unpack the tuple properly
-        hashed_pwd, salt_val = self._hash_password(password)
         internal_id = int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15)
         
         user_data = {
             'telegram_id': telegram_id,
             'username': username,
-            'password_hash': hashed_pwd, # Fixed schema
-            'password_salt': salt_val,   # Fixed schema
+            'password': password, # Storing plaintext password directly
             'full_name': full_name,
             'is_logged_in': True,
             'internal_user_id': internal_id,
@@ -95,8 +76,8 @@ class Database:
     async def login_user(self, telegram_id: int, username: str, password: str) -> dict:
         user = await self.auth_users.find_one({'username': username})
         
-        # Fixed: Verify using the proper function instead of direct query match
-        if user and self._verify_password(password, user.get('password_hash', ''), user.get('password_salt')):
+        # Directly comparing plaintext passwords
+        if user and user.get('password') == password:
             await self.auth_users.update_many(
                 {'telegram_id': telegram_id, 'is_logged_in': True},
                 {'$set': {'is_logged_in': False}}
@@ -107,6 +88,7 @@ class Database:
             )
             internal_id = user.get('internal_user_id') or (int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15))
             return {'success': True, 'internal_user_id': internal_id}
+        
         return {'success': False, 'internal_user_id': None}
     
     async def logout_user(self, telegram_id: int) -> bool:
