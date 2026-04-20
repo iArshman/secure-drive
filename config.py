@@ -32,6 +32,16 @@ PORT = int(os.getenv("PORT", 3000))
 FILES_PER_PAGE = 10
 ACCOUNTS_PER_PAGE = 10
 
+# ================= EXTERNAL OAUTH =================
+# Set to True to use an external OAuth bridge instead of your own Google OAuth app.
+# The bridge handles the Google OAuth flow and POSTs tokens back to your webhook.
+USE_EXTERNAL_OAUTH = os.getenv("USE_EXTERNAL_OAUTH", "False").lower() in ("true", "1", "yes")
+# Base URL of the external OAuth bridge (no trailing slash)
+EXTERNAL_OAUTH_URL = os.getenv("EXTERNAL_OAUTH_URL", "https://oauth.arshman.me")
+# Your bot's publicly accessible base URL — used to build the webhook return_url sent to the bridge
+# e.g. https://mybot.example.com  (no trailing slash)
+BOT_BASE_URL = os.getenv("BOT_BASE_URL", "https://your-domain.com")
+
 # ================= LOCAL SERVER (NEW) =================
 # Define if bot should use local Telegram API server
 USE_LOCAL_SERVER = os.getenv("USE_LOCAL_SERVER", "False").lower() in ("true", "1", "yes")
