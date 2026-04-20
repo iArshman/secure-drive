@@ -822,8 +822,11 @@ async def main():
         logger.error(f"Encryption key error: {e}")
         return
 
-    await set_bot_commands(bot)
-    logger.info("Bot commands registered")
+    try:
+        await set_bot_commands(bot)
+        logger.info("Bot commands registered")
+    except Exception as e:
+        logger.warning(f"Could not register bot commands (non-fatal): {e}")
 
     # Command handlers registration
     dp.message.register(cmd_start, CommandStart())
