@@ -1,480 +1,329 @@
 """
-Web server module for OAuth callbacks and status page
+Internal OAuth Bridge — web.py
+Serves on the same port as the bot's token receiver.
+
+Routes:
+  GET  /               — UI with generator + docs
+  GET  /start-auth     — Redirects user to Google sign-in
+  GET  /oauth_callback — Google redirects here after sign-in
+  POST /tokens         — Receives tokens from external OAuth bridge (external mode)
+
+Injected by main.py via setup():
+  bot, db, BOT_SERVER_URL, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, OAUTH_MODE
 """
-from aiohttp import web, ClientSession
-import logging
+
 import os
+import json
+import base64
+import logging
 import time
+from urllib.parse import urlencode
+from aiohttp import web, ClientSession
 
 logger = logging.getLogger(__name__)
 
-# Will be set by main.py
-bot = None
-db = None
-oauth_states = None
-CLIENT_ID = None
+# Injected by main.py
+bot           = None
+db            = None
+CLIENT_ID     = None
 CLIENT_SECRET = None
-REDIRECT_URI = None
-USE_EXTERNAL_OAUTH = False
+REDIRECT_URI  = None
+SCOPES        = None
+PORT          = 1025
+BOT_SERVER_URL = ""
+OAUTH_MODE    = "internal"
 
-def setup_web_module(bot_instance, db_instance, oauth_states_dict, client_id, client_secret, redirect_uri, use_external_oauth=False):
-    """Initialize web module with dependencies from main.py"""
-    global bot, db, oauth_states, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USE_EXTERNAL_OAUTH
-    bot = bot_instance
-    db = db_instance
-    oauth_states = oauth_states_dict
-    CLIENT_ID = client_id
-    CLIENT_SECRET = client_secret
-    REDIRECT_URI = redirect_uri
-    USE_EXTERNAL_OAUTH = use_external_oauth
+def setup(bot_inst, db_inst, bot_url, client_id, client_secret,
+          redirect_uri, scopes, port, oauth_mode):
+    global bot, db, BOT_SERVER_URL, CLIENT_ID, CLIENT_SECRET
+    global REDIRECT_URI, SCOPES, PORT, OAUTH_MODE
+    bot            = bot_inst
+    db             = db_inst
+    BOT_SERVER_URL = bot_url
+    CLIENT_ID      = client_id
+    CLIENT_SECRET  = client_secret
+    REDIRECT_URI   = redirect_uri
+    SCOPES         = scopes
+    PORT           = port
+    OAUTH_MODE     = oauth_mode
 
-async def get_user_email(access_token):
-    """Get user email from Google Drive API (FINAL STABLE VERSION)"""
+# Helpers
 
-    try:
-        headers = {"Authorization": f"Bearer {access_token}"}
+def _escape(text):
+    import html
+    return html.escape(str(text))
 
-        async with ClientSession() as session:
-            async with session.get(
-                "https://www.googleapis.com/drive/v3/about?fields=user",
-                headers=headers
-            ) as response:
-
-                if response.status == 200:
-                    data = await response.json()
-                    email = data.get("user", {}).get("emailAddress")
-
-                    if not email:
-                        logger.error(f"Email missing in Drive response: {data}")
-
-                    return email
-
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Drive API ERROR {response.status}: {error_text}"
-                    )
-
-    except Exception as e:
-        logger.error(f"Error getting user email: {e}")
-
+async def _get_email(access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with ClientSession() as s:
+        async with s.get(
+            "https://www.googleapis.com/drive/v3/about?fields=user",
+            headers=headers
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get("user", {}).get("emailAddress")
     return None
-    
-async def main_page_handler(request):
-    """Handle main page requests"""
-    bot_username = (await bot.get_me()).username if bot else "YOUR_BOT_USERNAME"
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Secure Drive</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ 
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                text-align: center; 
-                padding: 50px; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                margin: 0;
-                min-height: 100vh;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }}
-            .container {{ 
-                background: white; 
-                padding: 40px; 
-                border-radius: 16px; 
-                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-                max-width: 500px;
-            }}
-            .icon {{ font-size: 4em; margin-bottom: 20px; }}
-            h1 {{ color: #667eea; margin: 20px 0; }}
-            p {{ color: #666; line-height: 1.6; }}
-            .status {{ 
-                background: #28a745; 
-                color: white;
-                padding: 10px 20px; 
-                border-radius: 20px; 
-                display: inline-block;
-                margin: 20px 0;
-                font-weight: bold;
-            }}
-            .feature {{
-                text-align: left;
-                margin: 15px 0;
-                padding: 10px;
-                background: #f8f9fa;
-                border-radius: 8px;
-            }}
-            .bot-link {{
-                display: inline-block;
-                background: #667eea;
-                color: white;
-                padding: 15px 30px;
-                border-radius: 8px;
-                text-decoration: none;
-                margin-top: 20px;
-                font-weight: bold;
-                transition: background 0.3s;
-            }}
-            .bot-link:hover {{
-                background: #764ba2;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="icon">☁️</div>
-            <h1>Secure Drive</h1>
-            <div class="status"> Running</div>
-            <p>Manage your Google Drive files with Telegram!</p>
-            
-            <div class="feature">📁 Browse and organize files</div>
-            <div class="feature">⬆️ Upload files from Telegram</div>
-            <div class="feature">⬇️ Download files to Telegram</div>
-            <div class="feature">🔍 Search across your Drive</div>
-            <div class="feature">🔗 Generate shareable links</div>
-            <div class="feature">💾 View storage information</div>
-            
-            <a href="https://t.me/{bot_username}" class="bot-link">Open Bot in Telegram</a>
-            <p><a href="/privacy" style="color: #667eea; text-decoration: none;">Privacy Policy</a> • 
-               <a href="/terms" style="color: #667eea; text-decoration: none;">Terms of Service</a></p>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
 
-async def oauth_callback_handler(request):
-    """Handle OAuth callback from Google with PKCE-safe token exchange"""
+def _pack_state(internal_user_id, telegram_id, is_backup):
+    packed_u = f"{internal_user_id}:{telegram_id}:{1 if is_backup else 0}"
+    state = {"u": packed_u, "r": f"{BOT_SERVER_URL}/tokens"}
+    return base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
 
-    try:
-        code = request.query.get("code")
-        state = request.query.get("state")
+def _unpack_u(packed_u):
+    parts = packed_u.split(":")
+    return int(parts[0]), int(parts[1]), bool(int(parts[2]))
 
-        if not code or not state:
-            return web.Response(
-                text="Error: Missing code or state parameters.",
-                status=400
-            )
-
-        # Validate OAuth session state
-        state_data = oauth_states.get(state)
-
-        if not state_data:
-            return web.Response(
-                text="Session expired. Please restart connection from Telegram.",
-                status=400
-            )
-
-        user_id = state_data.get("user_id")
-        telegram_id = state_data.get("telegram_id")
-        flow = state_data.get("flow")
-        is_backup = state_data.get("is_backup", False)
-
-        if not flow:
-            return web.Response(
-                text="OAuth flow session missing. Restart connection.",
-                status=400
-            )
-
-        # Exchange authorization code securely
-        # Google may return extra scopes (e.g. openid, userinfo.email) — disable strict check
-        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
-        flow.fetch_token(code=code)
-
-        credentials = flow.credentials
-
-        # Extract tokens
-        tokens_data = {
-            "access_token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "expires_at": credentials.expiry.timestamp()
-        }
-
-        # Get Gmail address
-        email = await get_user_email(credentials.token)
-
-        if not email:
-            return web.Response(
-                text="Failed to retrieve account email.",
-                status=400
-            )
-
-        # Save account in database
-        account_id = await db.add_account(user_id, email, tokens_data)
-
-        # If this was added as a backup account, mark it as such
-        if is_backup:
-            await db.set_backup_account(user_id, account_id)
-
-        # Remove used OAuth session
-        oauth_states.pop(state, None)
-
-        # Notify Telegram user
-        try:
-            label = "Backup Account" if is_backup else "Secure Drive"
-            await bot.send_message(
-                telegram_id,
-                f"✅ <b>{label} Linked:</b> {email}",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-        return web.Response(
-            text="""
-            <html>
-            <body style='text-align:center;padding-top:100px;font-family:sans-serif;'>
-                <h1 style='color:#007bff;'>Success!</h1>
-                <p>Secure Drive is connected. Close this window and return to Telegram.</p>
-            </body>
-            </html>
-            """,
-            content_type="text/html"
-        )
-
-    except Exception as e:
-        logger.error(f"OAuth callback error: {e}")
-
-        return web.Response(
-            text="Internal Server Error",
-            status=500
-        )
-        
-async def privacy_policy_handler(request):
-    """Handle privacy policy page"""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Privacy Policy - Secure Drive</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #333; background: #f8f9fa; }
-            .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            h1 { color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 15px; margin-bottom: 30px; }
-            h2 { color: #495057; margin-top: 30px; margin-bottom: 15px; }
-            .last-updated { color: #6c757d; font-style: italic; margin-bottom: 30px; }
-            a { color: #667eea; text-decoration: none; }
-            .highlight { background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Privacy Policy</h1>
-            <p class="last-updated">Last Updated: December 20, 2025</p>
-            
-            <h2>1. Introduction</h2>
-            <p>Secure Drive ("we", "our", or "the bot") provides Google Drive management services through Telegram. This Privacy Policy explains how we collect, use, store, and delete your data.</p>
-            
-            <h2>2. Information We Collect</h2>
-            <p>We collect and process the following information:</p>
-            <ul>
-                <li><strong>Telegram User ID:</strong> Your unique Telegram identifier to link your account</li>
-                <li><strong>Google Drive Email:</strong> The email address associated with your connected Google Drive account</li>
-                <li><strong>OAuth Access Tokens:</strong> Encrypted tokens to access your Google Drive on your behalf</li>
-                <li><strong>File Metadata:</strong> Temporary file information (names, IDs, types) during operations</li>
-            </ul>
-            
-            <h2>3. How We Use Your Information</h2>
-            <p>Your data is used exclusively for:</p>
-            <ul>
-                <li>Authenticating and managing your Google Drive accounts</li>
-                <li>Browsing, uploading, downloading, and searching files</li>
-                <li>Creating shareable links</li>
-                <li>Performing file operations (rename, delete, organize)</li>
-            </ul>
-            <p><strong>We do NOT:</strong> Store file contents permanently, share your data with third parties, use your data for advertising, or access your Drive without explicit user commands.</p>
-            
-            <h2>4. Data Storage and Security</h2>
-            <p>We implement industry-standard security measures:</p>
-            <ul>
-                <li><strong>Encryption:</strong> OAuth tokens are encrypted using AES-256 encryption</li>
-                <li><strong>Secure Database:</strong> All data is stored in MongoDB with access controls</li>
-                <li><strong>No File Storage:</strong> File contents are never permanently stored on our servers</li>
-                <li><strong>Secure Transmission:</strong> All API communications use HTTPS/TLS</li>
-            </ul>
-            
-            <h2>5. Data Retention and Deletion</h2>
-            <div class="highlight">
-                <strong>Data Retention:</strong>
-                <ul>
-                    <li><strong>Account Data:</strong> We retain your Telegram User ID, connected email addresses, and OAuth tokens for as long as your Google Drive account remains connected to the bot</li>
-                    <li><strong>File Metadata:</strong> Temporary file information is retained only during active operations and is automatically deleted after completion</li>
-                    <li><strong>Session Data:</strong> OAuth states and temporary session data expire after 1 hour</li>
-                </ul>
-                
-                <strong>Data Deletion:</strong>
-                <p>You have full control over your data. We delete your information in the following ways:</p>
-                <ul>
-                    <li><strong>Manual Deletion:</strong> Use the /settings command in the bot and select "Remove Account" to immediately delete all stored data for that specific Google Drive account, including OAuth tokens and account information</li>
-                    <li><strong>Complete Account Removal:</strong> All your data is permanently deleted from our database within 24 hours of account disconnection</li>
-                    <li><strong>Inactive Accounts:</strong> Accounts inactive for more than 12 months may be automatically purged from our system</li>
-                    <li><strong>Upon Request:</strong> Contact us at support@arshman.space to request immediate data deletion, and we will comply within 7 business days</li>
-                </ul>
-                <p><strong>Note:</strong> After deletion, you will need to re-authenticate if you wish to use the service again. Data deletion is irreversible.</p>
-            </div>
-            
-            <h2>6. Google API Services User Data Policy</h2>
-            <p>Secure Drive's use and transfer of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
-            <p>We only request the minimum necessary permissions to provide our service and never use your Google user data for purposes unrelated to providing and improving Secure's features.</p>
-            
-            <h2>7. Third-Party Services</h2>
-            <p>We use the following third-party services:</p>
-            <ul>
-                <li><strong>Telegram:</strong> For bot messaging interface</li>
-                <li><strong>Google Drive API:</strong> For file operations</li>
-                <li><strong>MongoDB:</strong> For secure data storage</li>
-            </ul>
-            <p>Each service has its own privacy policy and data handling practices.</p>
-            
-            <h2>8. Your Rights</h2>
-            <p>You have the right to:</p>
-            <ul>
-                <li>Access your stored data</li>
-                <li>Request data deletion at any time</li>
-                <li>Revoke Google Drive access</li>
-                <li>Disconnect your account</li>
-            </ul>
-            
-            <h2>9. Changes to This Policy</h2>
-            <p>We may update this Privacy Policy from time to time. Continued use of the bot after changes constitutes acceptance of the updated policy.</p>
-            
-            <h2>10. Contact Us</h2>
-            <p>For questions or concerns about this Privacy Policy or your data, contact us at: <a href="mailto:support@arshman.space">support@arshman.space</a></p>
-            
-            <p style="margin-top: 40px; text-align: center;"><a href="/">← Back to Home</a></p>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
-async def terms_of_service_handler(request):
-    """Handle terms of service page"""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Terms of Service - Secure Drive</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #333; background: #f8f9fa; }
-            .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            h1 { color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 15px; margin-bottom: 30px; }
-            h2 { color: #495057; margin-top: 30px; margin-bottom: 15px; }
-            .last-updated { color: #6c757d; font-style: italic; margin-bottom: 30px; }
-            a { color: #667eea; text-decoration: none; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Terms of Service</h1>
-            <p class="last-updated">Last Updated: December 12, 2025</p>
-            
-            <h2>1. Acceptance of Terms</h2>
-            <p>By using Secure Drive, you agree to these Terms of Service.</p>
-            
-            <h2>2. Description of Service</h2>
-            <p>Secure Drive allows managing Google Drive files through Telegram, including browsing, uploading, downloading, searching, and sharing.</p>
-            
-            <h2>3. User Responsibilities</h2>
-            <p>Use the service lawfully, keep your account secure, and respect others' data.</p>
-            
-            <h2>4. Drive Account Access</h2>
-            <p>By connecting, you grant Secure drive permission to read, create, modify, and delete files in your Drive on your behalf.</p>
-            
-            <h2>5. Data Privacy</h2>
-            <p>See our <a href="/privacy">Privacy Policy</a> for details on data handling.</p>
-            
-            <p style="margin-top: 40px; text-align: center;"><a href="/">← Back to Home</a></p>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
-async def ext_oauth_callback_handler(request):
-    """
-    Webhook handler for the external OAuth bridge (oauth.arshman.me).
-    The bridge POSTs JSON here after the user completes Google sign-in:
-    {
-        "status": "success",
-        "user_id": "<state_key>",
-        "email": "user@gmail.com",
-        "credentials": {
-            "access_token": "...",
-            "refresh_token": "...",
-            "expires_at": 1713600000.0
-        }
-    }
-    The `user_id` field contains the state_key we embedded when building the
-    redirect URL, which lets us look up the pending oauth_states entry.
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        return web.Response(text="Invalid JSON", status=400)
-
-    if payload.get("status") != "success":
-        logger.warning(f"External OAuth non-success payload: {payload}")
-        return web.Response(text="Non-success status ignored", status=200)
-
-    state_key = payload.get("user_id")
-    email = payload.get("email")
-    creds = payload.get("credentials", {})
-
-    access_token = creds.get("access_token")
-    refresh_token = creds.get("refresh_token")
-    expires_at = creds.get("expires_at")
-
-    if not all([state_key, email, access_token]):
-        return web.Response(text="Missing required fields", status=400)
-
-    state_data = oauth_states.get(state_key)
-    if not state_data:
-        logger.warning(f"External OAuth: unknown state_key={state_key}")
-        return web.Response(text="Unknown state, possibly expired", status=400)
-
-    user_id = state_data["user_id"]
-    telegram_id = state_data["telegram_id"]
-    is_backup = state_data.get("is_backup", False)
-
+async def _save_and_notify(internal_user_id, telegram_id, is_backup, email, creds):
     tokens_data = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_at": expires_at or (time.time() + 3600),
+        "access_token":  creds["access_token"],
+        "refresh_token": creds.get("refresh_token"),
+        "expires_at":    creds.get("expires_at"),
     }
-
-    account_id = await db.add_account(user_id, email, tokens_data)
-
+    account_id = await db.add_account(internal_user_id, email, tokens_data)
     if is_backup:
-        await db.set_backup_account(user_id, account_id)
-
-    oauth_states.pop(state_key, None)
-
+        await db.set_backup_account(internal_user_id, account_id)
+        label = "Backup account"
+    else:
+        label = "Account"
+    logger.info(f"Saved tokens: user={internal_user_id} tg={telegram_id} email={email} backup={is_backup}")
     try:
-        label = "Backup Account" if is_backup else "Secure Drive"
         await bot.send_message(
             telegram_id,
-            f"✅ <b>{label} Linked:</b> {email}",
-            parse_mode="HTML",
+            f"<b>{label} linked:</b> <code>{_escape(email)}</code>\n\nUse /files to start browsing.",
+            parse_mode="HTML"
         )
     except Exception as e:
-        logger.error(f"Failed to notify user {telegram_id}: {e}")
+        logger.error(f"Telegram notify failed for {telegram_id}: {e}")
 
-    return web.Response(text="OK", status=200)
+# Route: GET /
 
+async def home_handler(request):
+    mode_badge = (
+        '<span style="background:#16a34a;color:white;padding:4px 12px;border-radius:20px;font-size:.85em">Internal Mode</span>'
+        if OAUTH_MODE == "internal" else
+        '<span style="background:#2563eb;color:white;padding:4px 12px;border-radius:20px;font-size:.85em">External Mode</span>'
+    )
+    callback_url = REDIRECT_URI or f"http://YOUR_IP:{PORT}/oauth_callback"
+    html_page = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Secure Drive OAuth</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#333;padding:30px 16px}}
+.wrap{{max-width:860px;margin:auto}}
+.card{{background:white;padding:28px 32px;border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,.07);margin-bottom:24px}}
+h1{{color:#1a73e8;font-size:1.7em;margin-bottom:6px}}
+h2{{color:#1a73e8;font-size:1.15em;margin-bottom:14px}}
+h3{{color:#374151;font-size:1em;margin:16px 0 6px}}
+p{{color:#555;line-height:1.65;margin-bottom:10px}}
+code{{background:#f1f3f4;padding:2px 7px;border-radius:5px;font-family:monospace;color:#c0392b;font-size:.92em}}
+pre{{background:#1e1e2e;color:#89b4fa;padding:16px;border-radius:10px;overflow-x:auto;font-size:.88em;line-height:1.5;margin:10px 0}}
+.step{{border-left:4px solid #1a73e8;padding-left:16px;margin-bottom:18px}}
+input,select{{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:.95em;margin:6px 0 12px}}
+input:focus,select:focus{{border-color:#1a73e8;outline:none}}
+.btn{{background:#1a73e8;color:white;border:none;padding:11px 26px;border-radius:8px;font-size:.95em;font-weight:600;cursor:pointer}}
+.btn:hover{{background:#1558b0}}
+.notice{{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;padding:14px 18px;border-radius:10px;font-size:.9em;margin-bottom:16px}}
+</style></head><body>
+<div class="wrap">
+  <div class="card">
+    <h1>Secure Drive OAuth</h1>
+    <p style="margin-top:8px">{mode_badge}</p>
+    <p style="margin-top:14px">Handles Google OAuth for the Secure Drive Telegram bot.</p>
+  </div>
 
-def create_web_app():
-    """Create and configure the web application"""
+  <div class="card">
+    <h2>Google Console Setup</h2>
+    <div class="notice">Add this as an <strong>Authorized Redirect URI</strong> in Google Cloud Console:</div>
+    <pre>{callback_url}</pre>
+    <p>Google Cloud Console → APIs &amp; Services → Credentials → OAuth Client → Authorized redirect URIs</p>
+  </div>
+
+  <div class="card">
+    <h2>Manual Token Generator</h2>
+    <label>Internal User ID</label>
+    <input type="text" id="uid" placeholder="e.g. 390607644363272">
+    <label>Telegram ID</label>
+    <input type="text" id="tid" placeholder="e.g. 7725409374">
+    <label>Account Type</label>
+    <select id="backup">
+      <option value="0">Primary Account</option>
+      <option value="1">Backup Account</option>
+    </select>
+    <button class="btn" onclick="startAuth()">Sign in with Google</button>
+  </div>
+
+  <div class="card">
+    <h2>Integration Guide</h2>
+    <div class="step">
+      <h3>State format (base64 encoded)</h3>
+      <pre>{{ "u": "internalId:telegramId:isBackup", "r": "http://BOT_IP:{PORT}/tokens" }}</pre>
+    </div>
+    <div class="step">
+      <h3>Start OAuth</h3>
+      <pre>GET /start-auth?state=BASE64_STATE</pre>
+    </div>
+    <div class="step">
+      <h3>Modes</h3>
+      <p><strong>Internal:</strong> tokens saved to MongoDB directly on this server.</p>
+      <p><strong>External:</strong> tokens POSTed to <code>{BOT_SERVER_URL}/tokens</code>.</p>
+    </div>
+    <div class="step">
+      <h3>.env config</h3>
+      <pre>OAUTH_MODE=internal        # internal | external
+OAUTH_SERVICE_URL=https://oauth.arshman.me  # external mode only
+BOT_SERVER_URL=http://YOUR_IP:{PORT}        # auto-detected if blank</pre>
+    </div>
+  </div>
+</div>
+<script>
+function startAuth() {{
+  var uid = document.getElementById('uid').value.trim();
+  var tid = document.getElementById('tid').value.trim();
+  var bak = document.getElementById('backup').value;
+  if (!uid || !tid) {{ alert('Enter both IDs'); return; }}
+  var state = btoa(JSON.stringify({{u: uid+':'+tid+':'+bak, r:'manual'}})).replace(/=/g,'');
+  window.location.href = '/start-auth?state=' + state;
+}}
+</script>
+</body></html>"""
+    return web.Response(text=html_page, content_type="text/html")
+
+# Route: GET /start-auth
+
+async def start_auth_handler(request):
+    state_raw = request.query.get("state")
+    if not state_raw:
+        return web.Response(text="Missing state parameter.", status=400)
+    scope_str = " ".join(SCOPES) if isinstance(SCOPES, list) else SCOPES
+    params = {
+        "client_id":     CLIENT_ID,
+        "redirect_uri":  REDIRECT_URI,
+        "response_type": "code",
+        "scope":         scope_str,
+        "access_type":   "offline",
+        "prompt":        "consent",
+        "state":         state_raw,
+    }
+    return web.HTTPFound(f"https://accounts.google.com/o/oauth2/auth?{urlencode(params)}")
+
+# Route: GET /oauth_callback
+
+async def oauth_callback_handler(request):
+    code      = request.query.get("code")
+    state_str = request.query.get("state")
+    if not code or not state_str:
+        return web.Response(text="Missing code or state.", status=400)
+    try:
+        async with ClientSession() as session:
+            async with session.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code":          code,
+                    "client_id":     CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "redirect_uri":  REDIRECT_URI,
+                    "grant_type":    "authorization_code",
+                }
+            ) as resp:
+                token_data = await resp.json()
+                if resp.status != 200:
+                    logger.error(f"Token exchange failed: {token_data}")
+                    return web.Response(
+                        text=f"Token exchange failed: {token_data.get('error_description', token_data.get('error'))}",
+                        status=400
+                    )
+
+        access_token  = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        expires_at    = time.time() + token_data.get("expires_in", 3600)
+        email         = await _get_email(access_token)
+
+        padding    = "=" * (4 - len(state_str) % 4)
+        state_data = json.loads(base64.urlsafe_b64decode(state_str + padding).decode())
+        packed_u   = state_data.get("u", "")
+        return_url = state_data.get("r", "manual")
+
+        creds = {
+            "access_token":  access_token,
+            "refresh_token": refresh_token,
+            "expires_at":    expires_at,
+        }
+
+        # Manual mode — show tokens on screen
+        if return_url == "manual":
+            display = json.dumps({"status":"success","user_id":packed_u,"email":email,"credentials":creds}, indent=4)
+            return web.Response(
+                text=f"""<html><body style="font-family:sans-serif;padding:40px;background:#f0f2f5">
+                <div style="background:white;padding:30px;border-radius:12px;max-width:700px;margin:auto">
+                <h2 style="color:#1a73e8">Tokens Generated</h2>
+                <p>Account: <b>{_escape(email)}</b></p>
+                <pre style="background:#1e1e2e;color:#89b4fa;padding:20px;border-radius:10px;overflow-x:auto">{display}</pre>
+                <p><a href="/" style="color:#1a73e8">Back</a></p>
+                </div></body></html>""",
+                content_type="text/html"
+            )
+
+        # Internal mode — save directly
+        if OAUTH_MODE == "internal":
+            internal_user_id, telegram_id, is_backup = _unpack_u(packed_u)
+            await _save_and_notify(internal_user_id, telegram_id, is_backup, email, creds)
+
+        # External mode — POST to bot
+        else:
+            payload = {"status":"success","user_id":packed_u,"email":email,"credentials":creds}
+            async with ClientSession() as session:
+                async with session.post(return_url, json=payload, timeout=20) as r:
+                    if r.status != 200:
+                        err = await r.text()
+                        return web.Response(text=f"Bot server rejected tokens: {err}", status=500)
+
+        return web.Response(
+            text=f"""<html><body style="text-align:center;padding-top:80px;font-family:sans-serif;background:#f0f2f5">
+            <div style="background:white;padding:40px;border-radius:14px;max-width:420px;margin:auto;box-shadow:0 4px 12px rgba(0,0,0,.1)">
+            <div style="font-size:3em">&#x2705;</div>
+            <h2 style="color:#16a34a;margin:14px 0 8px">Authorized!</h2>
+            <p style="color:#555"><b>{_escape(email)}</b> linked.</p>
+            <p style="color:#888;margin-top:12px;font-size:.9em">Close this window and return to Telegram.</p>
+            </div></body></html>""",
+            content_type="text/html"
+        )
+    except Exception as e:
+        logger.error(f"oauth_callback error: {e}", exc_info=True)
+        return web.Response(text=f"Internal error: {e}", status=500)
+
+# Route: POST /tokens (external mode receiver on bot side)
+
+async def tokens_handler(request):
+    try:
+        payload = await request.json()
+        logger.info(f"POST /tokens: {payload}")
+        if payload.get("status") != "success":
+            return web.Response(text="ignored", status=200)
+        packed_u = payload.get("user_id", "")
+        email    = payload.get("email")
+        creds    = payload.get("credentials", {})
+        try:
+            internal_user_id, telegram_id, is_backup = _unpack_u(packed_u)
+        except Exception:
+            logger.error(f"Bad user_id: {packed_u!r}")
+            return web.Response(text="bad user_id format", status=400)
+        if not email or not creds.get("access_token"):
+            return web.Response(text="missing email or tokens", status=400)
+        await _save_and_notify(internal_user_id, telegram_id, is_backup, email, creds)
+        return web.Response(text="ok", status=200)
+    except Exception as e:
+        logger.error(f"POST /tokens error: {e}", exc_info=True)
+        return web.Response(text="error", status=500)
+
+# App factory
+
+def create_app():
     app = web.Application()
-    app.router.add_get('/', main_page_handler)
-    app.router.add_get('/oauth_callback', oauth_callback_handler)
-    app.router.add_post('/ext_oauth_callback', ext_oauth_callback_handler)
-    app.router.add_get('/privacy', privacy_policy_handler)
-    app.router.add_get('/terms', terms_of_service_handler)
+    app.router.add_get( "/",                home_handler)
+    app.router.add_get( "/start-auth",      start_auth_handler)
+    app.router.add_get( "/oauth_callback",  oauth_callback_handler)
+    app.router.add_get( "/oauth_callback/", oauth_callback_handler)
+    app.router.add_post("/tokens",          tokens_handler)
     return app
