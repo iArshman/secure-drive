@@ -372,11 +372,15 @@ OAUTH_SERVICE_URL = os.getenv("OAUTH_SERVICE_URL", "https://oauth.arshman.me")
 BOT_SERVER_URL = os.getenv("BOT_SERVER_URL", "http://YOUR_SERVER_IP:1025")
 
 def build_oauth_url(internal_user_id: int, telegram_id: int, is_backup: bool = False) -> str:
-    """Build the oauth.arshman.me redirect URL with encoded state."""
+    """Build the oauth.arshman.me redirect URL with encoded state.
+    
+    We pack internal_user_id, telegram_id, and is_backup all into the 'u' field
+    as 'internalId:telegramId:isBackup' because the OAuth app only echoes 'u' back
+    in the payload's user_id field — it does not send the full state JSON back.
+    """
+    packed_u = f"{internal_user_id}:{telegram_id}:{1 if is_backup else 0}"
     state = {
-        "u": str(internal_user_id),
-        "t": str(telegram_id),
-        "b": 1 if is_backup else 0,
+        "u": packed_u,
         "r": f"{BOT_SERVER_URL}/tokens"
     }
     encoded = base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
@@ -386,38 +390,25 @@ async def tokens_handler(request: web.Request) -> web.Response:
     """Receives token payload POSTed by oauth.arshman.me after user signs in."""
     try:
         payload = await request.json()
+        logger.info(f"tokens_handler received: {payload}")
 
         if payload.get("status") != "success":
             return web.Response(text="ignored", status=200)
 
-        raw_state = payload.get("user_id", "")  # oauth app sends state's "u" field here
+        # OAuth app echoes back state["u"] as payload["user_id"]
+        packed_u = payload.get("user_id", "")
         email = payload.get("email")
         creds = payload.get("credentials", {})
 
-        # Decode full state to get telegram_id and is_backup
-        # The oauth app sends user_id = state["u"], but we need telegram_id too
-        # We re-decode from a separate "state" field if present, else fall back
-        state_raw = payload.get("state")
-        telegram_id = None
-        is_backup = False
-        internal_user_id = None
-
-        if state_raw:
-            try:
-                padding = "=" * (4 - len(state_raw) % 4)
-                state_data = json.loads(base64.urlsafe_b64decode(state_raw + padding).decode())
-                internal_user_id = int(state_data.get("u", 0))
-                telegram_id = int(state_data.get("t", 0))
-                is_backup = bool(state_data.get("b", 0))
-            except Exception as e:
-                logger.error(f"State decode error: {e}")
-        
-        if not internal_user_id:
-            try:
-                internal_user_id = int(raw_state)
-            except Exception:
-                logger.error(f"Could not parse user_id from payload: {raw_state}")
-                return web.Response(text="bad user_id", status=400)
+        # Unpack "internalId:telegramId:isBackup"
+        try:
+            parts = packed_u.split(":")
+            internal_user_id = int(parts[0])
+            telegram_id = int(parts[1])
+            is_backup = bool(int(parts[2]))
+        except Exception:
+            logger.error(f"Could not unpack user_id field: {packed_u!r}")
+            return web.Response(text="bad user_id format", status=400)
 
         if not email or not creds.get("access_token"):
             return web.Response(text="missing email or tokens", status=400)
@@ -436,18 +427,17 @@ async def tokens_handler(request: web.Request) -> web.Response:
         else:
             label = "Account"
 
-        logger.info(f"Tokens saved for user {internal_user_id} email {email} backup={is_backup}")
+        logger.info(f"Tokens saved for user {internal_user_id} (tg:{telegram_id}) email={email} backup={is_backup}")
 
-        # Notify user on Telegram if we have their telegram_id
-        if telegram_id and bot:
-            try:
-                await bot.send_message(
-                    telegram_id,
-                    f"✅ <b>{label} linked:</b> <code>{escape_html(email)}</code>\n\nUse /files to start browsing.",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify user {telegram_id}: {e}")
+        # Notify user on Telegram
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"✅ <b>{label} linked:</b> <code>{escape_html(email)}</code>\n\nUse /files to start browsing.",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify telegram_id={telegram_id}: {e}")
 
         return web.Response(text="ok", status=200)
 
