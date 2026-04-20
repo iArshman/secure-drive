@@ -12,13 +12,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 # Google OAuth Configuration
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "YOUR_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "YOUR_CLIENT_SECRET")
-
-# REDIRECT_URI - Auto-detect based on environment
-# If running locally, use http://localhost:3000, otherwise use configured domain
-if os.getenv("USE_LOCAL_SERVER", "False").lower() in ("true", "1", "yes"):
-    REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:3000/oauth_callback")
-else:
-    REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-domain.com/oauth_callback")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-domain.com/oauth_callback")
 
 # Google Drive API Scopes
 SCOPES = [
@@ -26,18 +20,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/drive.metadata.readonly"
 ]
-
-# ================= OAUTH BRIDGE (NEW) =================
-OAUTH_BRIDGE_URL = os.getenv("OAUTH_BRIDGE_URL", "https://oauth.arshman.me")
-
-def get_bot_webhook_url():
-    """Auto-detect bot receiver URL based on REDIRECT_URI"""
-    if REDIRECT_URI and "oauth_callback" in REDIRECT_URI:
-        return REDIRECT_URI.replace("oauth_callback", "receive_tokens")
-    return os.getenv("BOT_WEBHOOK_URL", "https://sd.arshman.me/receive_tokens")
-
-BOT_WEBHOOK_URL = get_bot_webhook_url()
-
 
 # MongoDB Configuration
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
