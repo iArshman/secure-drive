@@ -21,10 +21,9 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from config import BOT_TOKEN, USE_LOCAL_SERVER, LOCAL_SERVER_URL
-from config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI as _REDIRECT_URI_ENV, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
+from config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
 import base64, json
 from aiohttp import ClientSession as AiohttpClientSession
-import web as web_module
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
 
@@ -370,62 +369,91 @@ async def cmd_settings(message: Message):
 # ============= OAUTH HELPERS =============
 
 OAUTH_SERVICE_URL = os.getenv("OAUTH_SERVICE_URL", "https://oauth.arshman.me")
-OAUTH_MODE = os.getenv("OAUTH_MODE", "internal")
-_BOT_SERVER_URL_ENV = os.getenv("BOT_SERVER_URL", "")
-
-async def detect_public_url() -> str:
-    """Auto-detect this server's public IP if BOT_SERVER_URL is not set in .env."""
-    if _BOT_SERVER_URL_ENV:
-        logger.info(f"Using BOT_SERVER_URL from env: {_BOT_SERVER_URL_ENV}")
-        return _BOT_SERVER_URL_ENV
-    
-    # Try multiple public IP detection services in order
-    services = [
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://icanhazip.com",
-    ]
-    async with AiohttpClientSession() as session:
-        for url in services:
-            try:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        ip = (await resp.text()).strip()
-                        result = f"http://{ip}:{PORT}"
-                        logger.info(f"Auto-detected public URL: {result} (via {url})")
-                        return result
-            except Exception:
-                continue
-    
-    logger.warning("Could not auto-detect public IP. Falling back to localhost. Set BOT_SERVER_URL in .env to fix this.")
-    return f"http://localhost:{PORT}"
-
-BOT_SERVER_URL = ""  # Will be set in main() after async detection
-REDIRECT_URI = ""      # Will be set in main() after async detection
+BOT_SERVER_URL = os.getenv("BOT_SERVER_URL", "http://YOUR_SERVER_IP:1025")
 
 def build_oauth_url(internal_user_id: int, telegram_id: int, is_backup: bool = False) -> str:
-    """Build the OAuth redirect URL.
-    
-    Internal mode: points to this bot's own /start-auth endpoint.
-    External mode: points to OAUTH_SERVICE_URL (e.g. oauth.arshman.me).
-    
-    Packs all IDs into 'u' as 'internalId:telegramId:isBackup' since the
-    OAuth bridge only echoes back state["u"] in the token payload.
-    """
-    packed_u = f"{internal_user_id}:{telegram_id}:{1 if is_backup else 0}"
-    if OAUTH_MODE == "internal":
-        # Point to bot's own web server
-        base = BOT_SERVER_URL
-        return_url = f"{BOT_SERVER_URL}/tokens"
-    else:
-        # Point to external OAuth bridge
-        base = OAUTH_SERVICE_URL
-        return_url = f"{BOT_SERVER_URL}/tokens"
-    state = {"u": packed_u, "r": return_url}
+    """Build the oauth.arshman.me redirect URL with encoded state."""
+    state = {
+        "u": str(internal_user_id),
+        "t": str(telegram_id),
+        "b": 1 if is_backup else 0,
+        "r": f"{BOT_SERVER_URL}/tokens"
+    }
     encoded = base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
-    return f"{base}/start-auth?state={encoded}"
+    return f"{OAUTH_SERVICE_URL}/start-auth?state={encoded}"
 
-# tokens_handler moved to web.py
+async def tokens_handler(request: web.Request) -> web.Response:
+    """Receives token payload POSTed by oauth.arshman.me after user signs in."""
+    try:
+        payload = await request.json()
+
+        if payload.get("status") != "success":
+            return web.Response(text="ignored", status=200)
+
+        raw_state = payload.get("user_id", "")  # oauth app sends state's "u" field here
+        email = payload.get("email")
+        creds = payload.get("credentials", {})
+
+        # Decode full state to get telegram_id and is_backup
+        # The oauth app sends user_id = state["u"], but we need telegram_id too
+        # We re-decode from a separate "state" field if present, else fall back
+        state_raw = payload.get("state")
+        telegram_id = None
+        is_backup = False
+        internal_user_id = None
+
+        if state_raw:
+            try:
+                padding = "=" * (4 - len(state_raw) % 4)
+                state_data = json.loads(base64.urlsafe_b64decode(state_raw + padding).decode())
+                internal_user_id = int(state_data.get("u", 0))
+                telegram_id = int(state_data.get("t", 0))
+                is_backup = bool(state_data.get("b", 0))
+            except Exception as e:
+                logger.error(f"State decode error: {e}")
+        
+        if not internal_user_id:
+            try:
+                internal_user_id = int(raw_state)
+            except Exception:
+                logger.error(f"Could not parse user_id from payload: {raw_state}")
+                return web.Response(text="bad user_id", status=400)
+
+        if not email or not creds.get("access_token"):
+            return web.Response(text="missing email or tokens", status=400)
+
+        tokens_data = {
+            "access_token": creds["access_token"],
+            "refresh_token": creds.get("refresh_token"),
+            "expires_at": creds.get("expires_at")
+        }
+
+        account_id = await db.add_account(internal_user_id, email, tokens_data)
+
+        if is_backup:
+            await db.set_backup_account(internal_user_id, account_id)
+            label = "Backup account"
+        else:
+            label = "Account"
+
+        logger.info(f"Tokens saved for user {internal_user_id} email {email} backup={is_backup}")
+
+        # Notify user on Telegram if we have their telegram_id
+        if telegram_id and bot:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    f"✅ <b>{label} linked:</b> <code>{escape_html(email)}</code>\n\nUse /files to start browsing.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {telegram_id}: {e}")
+
+        return web.Response(text="ok", status=200)
+
+    except Exception as e:
+        logger.error(f"tokens_handler error: {e}", exc_info=True)
+        return web.Response(text="error", status=500)
 
 async def cmd_add(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
@@ -801,7 +829,7 @@ async def handle_user_input(message: Message):
 # ============= MAIN =============
 
 async def main():
-    global bot, db, dp, BOT_SERVER_URL, REDIRECT_URI
+    global bot, db, dp
     
     # === LOCAL SERVER LOGIC ADDED HERE ===
     if USE_LOCAL_SERVER:
@@ -826,12 +854,6 @@ async def main():
         logger.error(f"Encryption key error: {e}")
         return
 
-    BOT_SERVER_URL = await detect_public_url()
-    # Use REDIRECT_URI from .env if set, otherwise auto-build from detected URL
-    REDIRECT_URI = _REDIRECT_URI_ENV if _REDIRECT_URI_ENV else f"{BOT_SERVER_URL}/oauth_callback"
-    logger.info(f"Token receiver  : {BOT_SERVER_URL}/tokens")
-    logger.info(f"OAuth callback  : {REDIRECT_URI}")
-
     await set_bot_commands(bot)
     logger.info("Bot commands registered")
 
@@ -848,16 +870,14 @@ async def main():
     dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
-    # ── Web server (OAuth + token receiver) ──
-    web_module.setup(bot, db, BOT_SERVER_URL, CLIENT_ID, CLIENT_SECRET,
-                     REDIRECT_URI, SCOPES, PORT, OAUTH_MODE)  # REDIRECT_URI is runtime value
-    app = web_module.create_app()
+    # ── Token receiver web server ──
+    app = web.Application()
+    app.router.add_post('/tokens', tokens_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     try:
         await web.TCPSite(runner, '0.0.0.0', PORT).start()
-        logger.info(f"Web server listening on port {PORT} (OAUTH_MODE={OAUTH_MODE})")
-        logger.info(f"OAuth callback URL: {BOT_SERVER_URL}/oauth_callback")
+        logger.info(f"Token receiver listening on port {PORT}")
     except OSError as e:
         logger.error(f"Could not bind to port {PORT}: {e}\nKill existing: fuser -k {PORT}/tcp")
         await runner.cleanup()
