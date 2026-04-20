@@ -84,11 +84,12 @@ def format_file_size(size_bytes):
 def escape_html(text: str) -> str:
     return html.escape(str(text))
 
-async def store_file_data(account_id: str, file_id: str, parent_id: str = "root", next_token: str = None) -> str:
-    hash_value = hashlib.md5(f"{account_id}:{file_id}:{parent_id}:{next_token}".encode()).hexdigest()[:16]
+async def store_file_data(user_id: int, account_id: str, file_id: str, parent_id: str = "root", next_token: str = None) -> str:
+    hash_value = hashlib.md5(f"{user_id}:{account_id}:{file_id}:{parent_id}:{next_token}".encode()).hexdigest()[:16]
     await db.callback_data.update_one(
         {"hash": hash_value},
         {"$set": {
+            "user_id": user_id, 
             "hash": hash_value, 
             "account_id": account_id, 
             "file_id": file_id, 
@@ -144,21 +145,24 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
 
         keyboard = []
         for f in [x for x in processed_files if x['mimeType'] == 'application/vnd.google-apps.folder']:
-            h = await store_file_data(account_id, f['id'], folder_id)
+            # Pass account['user_id'] here
+            h = await store_file_data(account['user_id'], account_id, f['id'], folder_id)
             keyboard.append([InlineKeyboardButton(text=get_file_view(f['mimeType'], f['name']), callback_data=f"open:{h}")])
 
         files_list = [x for x in processed_files if x['mimeType'] != 'application/vnd.google-apps.folder']
         for i in range(0, len(files_list), 2):
             row = []
             for f in files_list[i:i+2]:
-                h = await store_file_data(account_id, f['id'], folder_id)
+                # Pass account['user_id'] here
+                h = await store_file_data(account['user_id'], account_id, f['id'], folder_id)
                 btn_text = get_file_view(f['mimeType'], f['name'])
                 if len(btn_text) > 20: btn_text = btn_text[:20] + ".."
                 row.append(InlineKeyboardButton(text=btn_text, callback_data=f"info:{h}"))
             keyboard.append(row)
 
         if next_pt:
-            nh = await store_file_data(account_id, folder_id, folder_id, next_pt)
+            # Pass account['user_id'] here
+            nh = await store_file_data(account['user_id'], account_id, folder_id, folder_id, next_pt)
             keyboard.append([InlineKeyboardButton(text="Next Page", callback_data=f"page:{nh}")])
 
         controls = []
@@ -180,6 +184,7 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
         err_msg = "Error fetching files."
         if isinstance(event, CallbackQuery): await event.answer(err_msg)
         else: await event.answer(err_msg)
+
 
 async def render_file_info(callback: CallbackQuery, h: str):
     f_data = await db.callback_data.find_one({"hash": h})
