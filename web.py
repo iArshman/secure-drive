@@ -443,5 +443,6 @@ def create_web_app():
     app.router.add_get('/', main_page_handler)
     app.router.add_get('/oauth_callback', oauth_callback_handler)
     app.router.add_get('/privacy', privacy_policy_handler)
+    app.router.add_post('/receive_tokens', receive_tokens_handler)
     app.router.add_get('/terms', terms_of_service_handler)
     return app
