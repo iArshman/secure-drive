@@ -84,11 +84,15 @@ def format_file_size(size_bytes):
 def escape_html(text: str) -> str:
     return html.escape(str(text))
 
-async def store_file_data(account_id: str, file_id: str, parent_id: str = "root", next_token: str = None) -> str:
-    hash_value = hashlib.md5(f"{account_id}:{file_id}:{parent_id}:{next_token}".encode()).hexdigest()[:16]
+async def store_file_data(user_id: int, account_id: str, file_id: str, parent_id: str = "root", next_token: str = None) -> str:
+    # Include user_id in the hash and the document
+    hash_payload = f"{user_id}:{account_id}:{file_id}:{parent_id}:{next_token}"
+    hash_value = hashlib.md5(hash_payload.encode()).hexdigest()[:16]
+    
     await db.callback_data.update_one(
         {"hash": hash_value},
         {"$set": {
+            "user_id": user_id, # Added to match index
             "hash": hash_value, 
             "account_id": account_id, 
             "file_id": file_id, 
@@ -99,6 +103,7 @@ async def store_file_data(account_id: str, file_id: str, parent_id: str = "root"
         upsert=True
     )
     return hash_value
+    
 
 def get_drive_service(access_token: str, refresh_token: str = None):
     creds = Credentials.from_authorized_user_info({
