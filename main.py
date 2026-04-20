@@ -8,18 +8,12 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 from bson import ObjectId
 
-import base64
-import json
-from config import OAUTH_BRIDGE_URL, BOT_WEBHOOK_URL
-
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, BotCommand
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
-from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
@@ -28,9 +22,10 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from config import BOT_TOKEN, USE_LOCAL_SERVER, LOCAL_SERVER_URL
 from config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
+import base64, json
+from aiohttp import ClientSession as AiohttpClientSession
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
-import web as web_module
 
 # Logging
 logging.basicConfig(
@@ -44,10 +39,7 @@ logger = logging.getLogger(__name__)
 bot: Optional[Bot] = None
 db: Optional[Database] = None
 dp: Optional[Dispatcher] = None
-oauth_states: Dict[str, dict] = {}
 user_states: Dict[int, dict] = {}
-
-
 
 # ============= MENU SETUP =============
 
@@ -374,6 +366,95 @@ async def cmd_settings(message: Message):
     
     await render_settings(message, internal_id)
 
+# ============= OAUTH HELPERS =============
+
+OAUTH_SERVICE_URL = os.getenv("OAUTH_SERVICE_URL", "https://oauth.arshman.me")
+BOT_SERVER_URL = os.getenv("BOT_SERVER_URL", "http://YOUR_SERVER_IP:1025")
+
+def build_oauth_url(internal_user_id: int, telegram_id: int, is_backup: bool = False) -> str:
+    """Build the oauth.arshman.me redirect URL with encoded state."""
+    state = {
+        "u": str(internal_user_id),
+        "t": str(telegram_id),
+        "b": 1 if is_backup else 0,
+        "r": f"{BOT_SERVER_URL}/tokens"
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
+    return f"{OAUTH_SERVICE_URL}/start-auth?state={encoded}"
+
+async def tokens_handler(request: web.Request) -> web.Response:
+    """Receives token payload POSTed by oauth.arshman.me after user signs in."""
+    try:
+        payload = await request.json()
+
+        if payload.get("status") != "success":
+            return web.Response(text="ignored", status=200)
+
+        raw_state = payload.get("user_id", "")  # oauth app sends state's "u" field here
+        email = payload.get("email")
+        creds = payload.get("credentials", {})
+
+        # Decode full state to get telegram_id and is_backup
+        # The oauth app sends user_id = state["u"], but we need telegram_id too
+        # We re-decode from a separate "state" field if present, else fall back
+        state_raw = payload.get("state")
+        telegram_id = None
+        is_backup = False
+        internal_user_id = None
+
+        if state_raw:
+            try:
+                padding = "=" * (4 - len(state_raw) % 4)
+                state_data = json.loads(base64.urlsafe_b64decode(state_raw + padding).decode())
+                internal_user_id = int(state_data.get("u", 0))
+                telegram_id = int(state_data.get("t", 0))
+                is_backup = bool(state_data.get("b", 0))
+            except Exception as e:
+                logger.error(f"State decode error: {e}")
+        
+        if not internal_user_id:
+            try:
+                internal_user_id = int(raw_state)
+            except Exception:
+                logger.error(f"Could not parse user_id from payload: {raw_state}")
+                return web.Response(text="bad user_id", status=400)
+
+        if not email or not creds.get("access_token"):
+            return web.Response(text="missing email or tokens", status=400)
+
+        tokens_data = {
+            "access_token": creds["access_token"],
+            "refresh_token": creds.get("refresh_token"),
+            "expires_at": creds.get("expires_at")
+        }
+
+        account_id = await db.add_account(internal_user_id, email, tokens_data)
+
+        if is_backup:
+            await db.set_backup_account(internal_user_id, account_id)
+            label = "Backup account"
+        else:
+            label = "Account"
+
+        logger.info(f"Tokens saved for user {internal_user_id} email {email} backup={is_backup}")
+
+        # Notify user on Telegram if we have their telegram_id
+        if telegram_id and bot:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    f"✅ <b>{label} linked:</b> <code>{escape_html(email)}</code>\n\nUse /files to start browsing.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {telegram_id}: {e}")
+
+        return web.Response(text="ok", status=200)
+
+    except Exception as e:
+        logger.error(f"tokens_handler error: {e}", exc_info=True)
+        return web.Response(text="error", status=500)
+
 async def cmd_add(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
         return await message.answer("Please login first using /start")
@@ -382,25 +463,10 @@ async def cmd_add(message: Message):
     if not internal_id:
         return await message.answer("Please login first using /start")
 
-    # 1. Prepare the state for the bridge
-    state_obj = {
-        "u": str(internal_id),         # Internal User ID
-        "r": BOT_WEBHOOK_URL,          # Where bridge should send tokens
-        "x": str(message.from_user.id) # Extra: Telegram ID for notification
-    }
-    
-    # 2. Encode to Base64
-    state_b64 = base64.urlsafe_b64encode(json.dumps(state_obj).encode()).decode().rstrip("=")
-    
-    # 3. Create bridge URL
-    auth_url = f"{OAUTH_BRIDGE_URL}/start-auth?state={state_b64}"
-
+    auth_url = build_oauth_url(internal_id, message.from_user.id, is_backup=False)
     await message.answer(
-        "<b>Link Google Drive Account</b>\nClick below to authorize via our secure bridge:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Connect Google Drive", url=auth_url)
-        ]]),
-        parse_mode="HTML"
+        "Link Account:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]])
     )
  
 async def cmd_logout(message: Message):
@@ -682,10 +748,7 @@ async def handle_user_input(message: Message):
             del user_states[telegram_id]
             await message.answer(f"<b>Backup account set:</b>\n{escape_html(email)}\n\nUse /settings to enable/disable backup.", parse_mode="HTML")
         else:
-            state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
-            flow = Flow.from_client_config({"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}}, scopes=SCOPES, redirect_uri=REDIRECT_URI)
-            auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=state_key)
-            oauth_states[state_key] = {"user_id": user_id, "telegram_id": telegram_id, "is_backup": True, "flow": flow}
+            auth_url = build_oauth_url(user_id, telegram_id, is_backup=True)
             del user_states[telegram_id]
             await message.answer(f"Account with email <code>{escape_html(email)}</code> not found.\n\nClick below to add this account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect as Backup Account", url=auth_url)]]), parse_mode="HTML")
         return
@@ -807,16 +870,27 @@ async def main():
     dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
-    if hasattr(web_module, 'setup_web_module'):
-        web_module.setup_web_module(bot, db, oauth_states, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
-        app = web_module.create_web_app()
-        runner = web.AppRunner(app)
-        await runner.setup()
+    # ── Token receiver web server ──
+    app = web.Application()
+    app.router.add_post('/tokens', tokens_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
         await web.TCPSite(runner, '0.0.0.0', PORT).start()
-        logger.info(f"Web server started on port {PORT}")
-    
+        logger.info(f"Token receiver listening on port {PORT}")
+    except OSError as e:
+        logger.error(f"Could not bind to port {PORT}: {e}\nKill existing: fuser -k {PORT}/tcp")
+        await runner.cleanup()
+        await bot.session.close()
+        return
+
     logger.info("Bot is running...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+        logger.info("Bot shut down cleanly.")
 
 if __name__ == "__main__":
     asyncio.run(main())
