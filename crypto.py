@@ -40,14 +40,18 @@ def encrypt_name(name: str, enabled: bool = True) -> str:
         return name if name else "Untitled"
     _check()
     if not name: return "Untitled"
-    return cipher.encrypt(name.encode()).decode()
+    # Use urlsafe_b64encode to avoid '/' and '+'
+    token = cipher.encrypt(name.encode())
+    return base64.urlsafe_b64encode(token).decode()
 
 def decrypt_name(enc_name: str, enabled: bool = True) -> str:
     if not enabled:
         return enc_name
     _check()
     try:
-        return cipher.decrypt(enc_name.encode()).decode()
+        # Add padding if missing and decode
+        padding = "=" * (4 - len(enc_name) % 4)
+        raw_token = base64.urlsafe_b64decode(enc_name + padding)
+        return cipher.decrypt(raw_token).decode()
     except Exception:
-        logger.warning("decrypt_name: failed to decrypt name, returning raw value")
         return enc_name
