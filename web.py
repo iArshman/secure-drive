@@ -57,49 +57,7 @@ async def get_user_email(access_token):
         logger.error(f"Error getting user email: {e}")
 
     return None
-
-async def receive_tokens_handler(request):
-    """Endpoint called by the Bridge to deliver tokens"""
-    try:
-        data = await request.json()
-        
-        user_id_str = data.get("user_id")
-        email = data.get("email")
-        creds = data.get("credentials")
-        telegram_id_str = data.get("extra", "0") 
-
-        if not all([user_id_str, email, creds]):
-            return web.Response(text="Missing data from bridge", status=400)
-
-        user_id = int(user_id_str)
-        telegram_id = int(telegram_id_str) if telegram_id_str.isdigit() else 0
-
-        # Save to DB using your existing method
-        token_data = {
-            "access_token": creds["access_token"],
-            "refresh_token": creds.get("refresh_token"),
-            "expires_at": creds["expires_at"]
-        }
-        
-        await db.add_account(user_id, email, token_data)
-        
-        # Notify user on Telegram
-        if telegram_id:
-            try:
-                await bot.send_message(
-                    telegram_id, 
-                    f"✅ <b>Account Linked Successfully:</b> {email}", 
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Could not send success message to user: {e}")
-
-        return web.Response(text="OK")
-    except Exception as e:
-        logger.error(f"Bridge receiver error: {e}")
-        return web.Response(text=str(e), status=500)
-
-
+    
 async def main_page_handler(request):
     """Handle main page requests"""
     bot_username = (await bot.get_me()).username if bot else "YOUR_BOT_USERNAME"
@@ -443,6 +401,5 @@ def create_web_app():
     app.router.add_get('/', main_page_handler)
     app.router.add_get('/oauth_callback', oauth_callback_handler)
     app.router.add_get('/privacy', privacy_policy_handler)
-    app.router.add_post('/receive_tokens', receive_tokens_handler)
     app.router.add_get('/terms', terms_of_service_handler)
     return app
