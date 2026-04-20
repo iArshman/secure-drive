@@ -14,6 +14,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
+from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
@@ -21,12 +22,11 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from config import BOT_TOKEN, USE_LOCAL_SERVER, LOCAL_SERVER_URL
-from config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI as _REDIRECT_URI_ENV, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
-import base64, json
-from aiohttp import ClientSession as AiohttpClientSession
-import web as web_module
+from config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES, PORT, MAX_DOWNLOAD_SIZE, MAX_UPLOAD_SIZE
+from config import USE_EXTERNAL_OAUTH, EXTERNAL_OAUTH_URL, BOT_BASE_URL
 from database import Database
 from crypto import encrypt_data, decrypt_data, encrypt_name, decrypt_name, init_cipher
+import web as web_module
 
 # Logging
 logging.basicConfig(
@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 bot: Optional[Bot] = None
 db: Optional[Database] = None
 dp: Optional[Dispatcher] = None
+oauth_states: Dict[str, dict] = {}
 user_states: Dict[int, dict] = {}
 
 # ============= MENU SETUP =============
@@ -367,65 +368,15 @@ async def cmd_settings(message: Message):
     
     await render_settings(message, internal_id)
 
-# ============= OAUTH HELPERS =============
+import base64, json as _json
 
-OAUTH_SERVICE_URL = os.getenv("OAUTH_SERVICE_URL", "https://oauth.arshman.me")
-OAUTH_MODE = os.getenv("OAUTH_MODE", "internal")
-_BOT_SERVER_URL_ENV = os.getenv("BOT_SERVER_URL", "")
+def _build_external_auth_url(state_key: str, is_backup: bool = False) -> str:
+    """Build redirect URL for the external OAuth bridge."""
+    return_url = f"{BOT_BASE_URL}/ext_oauth_callback"
+    state_payload = _json.dumps({"u": state_key, "r": return_url})
+    encoded_state = base64.urlsafe_b64encode(state_payload.encode()).decode()
+    return f"{EXTERNAL_OAUTH_URL}/start-auth?state={encoded_state}"
 
-async def detect_public_url() -> str:
-    """Auto-detect this server's public IP if BOT_SERVER_URL is not set in .env."""
-    if _BOT_SERVER_URL_ENV:
-        logger.info(f"Using BOT_SERVER_URL from env: {_BOT_SERVER_URL_ENV}")
-        return _BOT_SERVER_URL_ENV
-    
-    # Try multiple public IP detection services in order
-    services = [
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://icanhazip.com",
-    ]
-    async with AiohttpClientSession() as session:
-        for url in services:
-            try:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        ip = (await resp.text()).strip()
-                        result = f"http://{ip}:{PORT}"
-                        logger.info(f"Auto-detected public URL: {result} (via {url})")
-                        return result
-            except Exception:
-                continue
-    
-    logger.warning("Could not auto-detect public IP. Falling back to localhost. Set BOT_SERVER_URL in .env to fix this.")
-    return f"http://localhost:{PORT}"
-
-BOT_SERVER_URL = ""  # Will be set in main() after async detection
-REDIRECT_URI = ""      # Will be set in main() after async detection
-
-def build_oauth_url(internal_user_id: int, telegram_id: int, is_backup: bool = False) -> str:
-    """Build the OAuth redirect URL.
-    
-    Internal mode: points to this bot's own /start-auth endpoint.
-    External mode: points to OAUTH_SERVICE_URL (e.g. oauth.arshman.me).
-    
-    Packs all IDs into 'u' as 'internalId:telegramId:isBackup' since the
-    OAuth bridge only echoes back state["u"] in the token payload.
-    """
-    packed_u = f"{internal_user_id}:{telegram_id}:{1 if is_backup else 0}"
-    if OAUTH_MODE == "internal":
-        # Point to bot's own web server
-        base = BOT_SERVER_URL
-        return_url = f"{BOT_SERVER_URL}/tokens"
-    else:
-        # Point to external OAuth bridge
-        base = OAUTH_SERVICE_URL
-        return_url = f"{BOT_SERVER_URL}/tokens"
-    state = {"u": packed_u, "r": return_url}
-    encoded = base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
-    return f"{base}/start-auth?state={encoded}"
-
-# tokens_handler moved to web.py
 
 async def cmd_add(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
@@ -435,10 +386,46 @@ async def cmd_add(message: Message):
     if not internal_id:
         return await message.answer("Please login first using /start")
 
-    auth_url = build_oauth_url(internal_id, message.from_user.id, is_backup=False)
+    state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
+
+    if USE_EXTERNAL_OAUTH:
+        auth_url = _build_external_auth_url(state_key)
+        # Store minimal state — no flow object needed
+        oauth_states[state_key] = {
+            "user_id": internal_id,
+            "telegram_id": message.from_user.id,
+            "is_backup": False,
+        }
+    else:
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            },
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI,
+        )
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+            state=state_key,
+        )
+        oauth_states[state_key] = {
+            "user_id": internal_id,
+            "telegram_id": message.from_user.id,
+            "flow": flow,
+        }
+
     await message.answer(
         "Link Account:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]])
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]]
+        ),
     )
  
 async def cmd_logout(message: Message):
@@ -720,7 +707,16 @@ async def handle_user_input(message: Message):
             del user_states[telegram_id]
             await message.answer(f"<b>Backup account set:</b>\n{escape_html(email)}\n\nUse /settings to enable/disable backup.", parse_mode="HTML")
         else:
-            auth_url = build_oauth_url(user_id, telegram_id, is_backup=True)
+            state_key = f"{telegram_id}_{int(datetime.now().timestamp())}_backup"
+
+            if USE_EXTERNAL_OAUTH:
+                auth_url = _build_external_auth_url(state_key, is_backup=True)
+                oauth_states[state_key] = {"user_id": user_id, "telegram_id": telegram_id, "is_backup": True}
+            else:
+                flow = Flow.from_client_config({"web": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}}, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+                auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=state_key)
+                oauth_states[state_key] = {"user_id": user_id, "telegram_id": telegram_id, "is_backup": True, "flow": flow}
+
             del user_states[telegram_id]
             await message.answer(f"Account with email <code>{escape_html(email)}</code> not found.\n\nClick below to add this account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect as Backup Account", url=auth_url)]]), parse_mode="HTML")
         return
@@ -801,7 +797,7 @@ async def handle_user_input(message: Message):
 # ============= MAIN =============
 
 async def main():
-    global bot, db, dp, BOT_SERVER_URL, REDIRECT_URI
+    global bot, db, dp
     
     # === LOCAL SERVER LOGIC ADDED HERE ===
     if USE_LOCAL_SERVER:
@@ -826,12 +822,6 @@ async def main():
         logger.error(f"Encryption key error: {e}")
         return
 
-    BOT_SERVER_URL = await detect_public_url()
-    # Use REDIRECT_URI from .env if set, otherwise auto-build from detected URL
-    REDIRECT_URI = _REDIRECT_URI_ENV if _REDIRECT_URI_ENV else f"{BOT_SERVER_URL}/oauth_callback"
-    logger.info(f"Token receiver  : {BOT_SERVER_URL}/tokens")
-    logger.info(f"OAuth callback  : {REDIRECT_URI}")
-
     await set_bot_commands(bot)
     logger.info("Bot commands registered")
 
@@ -848,29 +838,16 @@ async def main():
     dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
-    # ── Web server (OAuth + token receiver) ──
-    web_module.setup(bot, db, BOT_SERVER_URL, CLIENT_ID, CLIENT_SECRET,
-                     REDIRECT_URI, SCOPES, PORT, OAUTH_MODE)  # REDIRECT_URI is runtime value
-    app = web_module.create_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    try:
+    if hasattr(web_module, 'setup_web_module'):
+        web_module.setup_web_module(bot, db, oauth_states, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, use_external_oauth=USE_EXTERNAL_OAUTH)
+        app = web_module.create_web_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
         await web.TCPSite(runner, '0.0.0.0', PORT).start()
-        logger.info(f"Web server listening on port {PORT} (OAUTH_MODE={OAUTH_MODE})")
-        logger.info(f"OAuth callback URL: {BOT_SERVER_URL}/oauth_callback")
-    except OSError as e:
-        logger.error(f"Could not bind to port {PORT}: {e}\nKill existing: fuser -k {PORT}/tcp")
-        await runner.cleanup()
-        await bot.session.close()
-        return
-
+        logger.info(f"Web server started on port {PORT}")
+    
     logger.info("Bot is running...")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await runner.cleanup()
-        await bot.session.close()
-        logger.info("Bot shut down cleanly.")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
