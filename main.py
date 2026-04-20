@@ -378,10 +378,12 @@ BOT_SERVER_URL = os.getenv("BOT_SERVER_URL", "http://YOUR_SERVER_IP:1025")
 
 def build_oauth_url(internal_user_id: int, telegram_id: int, is_backup: bool = False) -> str:
     """Build the oauth.arshman.me redirect URL with encoded state."""
+    
+    backup_flag = "1" if is_backup else "0"
+    combined_u = f"{internal_user_id}:{telegram_id}:{backup_flag}"
+    
     state = {
-        "u": str(internal_user_id),
-        "t": str(telegram_id),
-        "b": 1 if is_backup else 0,
+        "u": combined_u,
         "r": f"{BOT_SERVER_URL}/tokens"
     }
     encoded = base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
@@ -399,30 +401,26 @@ async def tokens_handler(request: web.Request) -> web.Response:
         email = payload.get("email")
         creds = payload.get("credentials", {})
 
-        # Decode full state to get telegram_id and is_backup
-        # The oauth app sends user_id = state["u"], but we need telegram_id too
-        # We re-decode from a separate "state" field if present, else fall back
-        state_raw = payload.get("state")
         telegram_id = None
         is_backup = False
         internal_user_id = None
 
-        if state_raw:
+        # Parse the combined state from the "u" field
+        if raw_state:
             try:
-                padding = "=" * (4 - len(state_raw) % 4)
-                state_data = json.loads(base64.urlsafe_b64decode(state_raw + padding).decode())
-                internal_user_id = int(state_data.get("u", 0))
-                telegram_id = int(state_data.get("t", 0))
-                is_backup = bool(state_data.get("b", 0))
+                parts = raw_state.split(":")
+                if len(parts) >= 1:
+                    internal_user_id = int(parts[0])
+                if len(parts) >= 2:
+                    telegram_id = int(parts[1])
+                if len(parts) >= 3:
+                    is_backup = (parts[2] == "1")
             except Exception as e:
-                logger.error(f"State decode error: {e}")
-        
+                logger.error(f"Could not parse user_id payload: {raw_state} - {e}")
+                return web.Response(text="bad user_id format", status=400)
+
         if not internal_user_id:
-            try:
-                internal_user_id = int(raw_state)
-            except Exception:
-                logger.error(f"Could not parse user_id from payload: {raw_state}")
-                return web.Response(text="bad user_id", status=400)
+            return web.Response(text="missing internal_user_id", status=400)
 
         if not email or not creds.get("access_token"):
             return web.Response(text="missing email or tokens", status=400)
@@ -443,7 +441,7 @@ async def tokens_handler(request: web.Request) -> web.Response:
 
         logger.info(f"Tokens saved for user {internal_user_id} email {email} backup={is_backup}")
 
-        # Notify user on Telegram if we have their telegram_id
+        # Notify user on Telegram since we now reliably have their telegram_id
         if telegram_id and bot:
             try:
                 await bot.send_message(
