@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from cryptography.fernet import Fernet
 import hashlib
+import os
 from config import MONGO_URI, DATABASE_NAME
 
 class Database:
@@ -23,6 +24,7 @@ class Database:
     async def create_indexes(self):
         await self.users.create_index('user_id', unique=True)
         await self.accounts.create_index([('user_id', 1), ('email', 1)])
+        # Fixed: Added user_id to match the main.py payload
         await self.callback_data.create_index([('user_id', 1), ('hash', 1)], unique=True)
         await self.callback_data.create_index('created_at', expireAfterSeconds=604800)
         await self.auth_users.create_index('username', unique=True)
@@ -43,7 +45,6 @@ class Database:
     
     def _hash_password(self, password: str, salt: bytes = None) -> tuple[str, str]:
         """Returns (hashed_hex, salt_hex). If salt is None, a new one is generated."""
-        import os
         if salt is None:
             salt = os.urandom(16)
         dk = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
@@ -68,13 +69,15 @@ class Database:
             {'$set': {'is_logged_in': False}}
         )
         
-        hashed_pwd = self._hash_password(password)
+        # Fixed: Unpack the tuple properly
+        hashed_pwd, salt_val = self._hash_password(password)
         internal_id = int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15)
         
         user_data = {
             'telegram_id': telegram_id,
             'username': username,
-            'password': hashed_pwd,
+            'password_hash': hashed_pwd, # Fixed schema
+            'password_salt': salt_val,   # Fixed schema
             'full_name': full_name,
             'is_logged_in': True,
             'internal_user_id': internal_id,
@@ -90,10 +93,10 @@ class Database:
         return {'success': True, 'error': None, 'internal_user_id': internal_id}
     
     async def login_user(self, telegram_id: int, username: str, password: str) -> dict:
-        hashed_pwd = self._hash_password(password)
-        user = await self.auth_users.find_one({'username': username, 'password': hashed_pwd})
+        user = await self.auth_users.find_one({'username': username})
         
-        if user:
+        # Fixed: Verify using the proper function instead of direct query match
+        if user and self._verify_password(password, user.get('password_hash', ''), user.get('password_salt')):
             await self.auth_users.update_many(
                 {'telegram_id': telegram_id, 'is_logged_in': True},
                 {'$set': {'is_logged_in': False}}
