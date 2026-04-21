@@ -378,88 +378,6 @@ async def cmd_settings(message: Message):
     
     await render_settings(message, internal_id)
 
-# ============= OAUTH HELPERS =============
-
-OAUTH_SERVICE_URL = os.getenv("OAUTH_SERVICE_URL", "https://oauth.arshman.me")
-BOT_SERVER_URL = os.getenv("BOT_SERVER_URL", "http://YOUR_SERVER_IP:1025")
-
-def build_oauth_url(internal_user_id: int, telegram_id: int, is_backup: bool = False) -> str:
-    backup_flag = "1" if is_backup else "0"
-    combined_u = f"{internal_user_id}:{telegram_id}:{backup_flag}"
-    
-    state = {
-        "u": combined_u,
-        "r": f"{BOT_SERVER_URL}/tokens"
-    }
-    encoded = base64.urlsafe_b64encode(json.dumps(state).encode()).decode().rstrip("=")
-    return f"{OAUTH_SERVICE_URL}/start-auth?state={encoded}"
-
-async def tokens_handler(request: web.Request) -> web.Response:
-    try:
-        payload = await request.json()
-
-        if payload.get("status") != "success":
-            return web.Response(text="ignored", status=200)
-
-        raw_state = payload.get("user_id", "")  
-        email = payload.get("email")
-        creds = payload.get("credentials", {})
-
-        telegram_id = None
-        is_backup = False
-        internal_user_id = None
-
-        if raw_state:
-            try:
-                parts = raw_state.split(":")
-                if len(parts) >= 1:
-                    internal_user_id = int(parts[0])
-                if len(parts) >= 2:
-                    telegram_id = int(parts[1])
-                if len(parts) >= 3:
-                    is_backup = (parts[2] == "1")
-            except Exception as e:
-                logger.error(f"Could not parse user_id payload: {raw_state} - {e}")
-                return web.Response(text="bad user_id format", status=400)
-
-        if not internal_user_id:
-            return web.Response(text="missing internal_user_id", status=400)
-
-        if not email or not creds.get("access_token"):
-            return web.Response(text="missing email or tokens", status=400)
-
-        tokens_data = {
-            "access_token": creds["access_token"],
-            "refresh_token": creds.get("refresh_token"),
-            "expires_at": creds.get("expires_at")
-        }
-
-        account_id = await db.add_account(internal_user_id, email, tokens_data)
-
-        if is_backup:
-            await db.set_backup_account(internal_user_id, account_id)
-            label = "Backup account"
-        else:
-            label = "Account"
-
-        logger.info(f"Tokens saved for user {internal_user_id} email {email} backup={is_backup}")
-
-        if telegram_id and bot:
-            try:
-                await bot.send_message(
-                    telegram_id,
-                    f"✅ <b>{label} linked:</b> <code>{escape_html(email)}</code>\n\nUse /files to start browsing.",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify user {telegram_id}: {e}")
-
-        return web.Response(text="ok", status=200)
-
-    except Exception as e:
-        logger.error(f"tokens_handler error: {e}", exc_info=True)
-        return web.Response(text="error", status=500)
-
 async def cmd_add(message: Message):
     if not await db.is_user_logged_in(message.from_user.id):
         return await message.answer("Please login first using /start")
@@ -468,11 +386,28 @@ async def cmd_add(message: Message):
     if not internal_id:
         return await message.answer("Please login first using /start")
 
-    auth_url = build_oauth_url(internal_id, message.from_user.id, is_backup=False)
+    state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+        },
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+
+    auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=state_key)
+    oauth_states[state_key] = {"user_id": internal_id, "telegram_id": message.from_user.id, "flow": flow}
+
     await message.answer(
         "Link Account:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect Google Drive", url=auth_url)]])
     )
+ 
  
 async def cmd_logout(message: Message):
     user_id = message.from_user.id
