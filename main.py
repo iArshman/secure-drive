@@ -17,6 +17,7 @@ from aiohttp import web
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google_auth_oauthlib.flow import Flow
 
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -40,6 +41,7 @@ bot: Optional[Bot] = None
 db: Optional[Database] = None
 dp: Optional[Dispatcher] = None
 user_states: Dict[int, dict] = {}
+oauth_states: Dict[str, dict] = {} # Added to support cmd_add
 
 # ============= MENU SETUP =============
 
@@ -172,6 +174,7 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
             controls.append(InlineKeyboardButton(text="+ New Folder", callback_data=f"mkdir:{folder_id}"))
             controls.append(InlineKeyboardButton(text="↑ Upload", callback_data=f"up:{folder_id}"))
             keyboard.append(controls)
+            keyboard.append([InlineKeyboardButton(text="🔄 Switch Account", callback_data="view_accounts")]) # New Account Switcher
         else:
             keyboard.append([InlineKeyboardButton(text="← Back to Root", callback_data="go_root")])
 
@@ -297,6 +300,7 @@ async def render_settings(event, user_id: int):
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     
+    # [FIX] Clear any stuck states when starting
     if user_id in user_states:
         del user_states[user_id]
         
@@ -428,9 +432,7 @@ async def handle_callback(callback: CallbackQuery):
     data = callback.data
     telegram_id = callback.from_user.id
 
-    # [FIX] Protect upload state from being interrupted, but allow escape routes
     if telegram_id in user_states and user_states[telegram_id]['action'] in ["upload_file", "batch_upload"]:
-        # Allow finishing batch, logging out, or going back to settings
         if not any(data.startswith(x) for x in ["batch_done", "logout", "back_set"]):
             return await callback.answer("Please finish your upload first or click Logout/Settings to reset.", show_alert=True)
 
@@ -454,7 +456,19 @@ async def handle_callback(callback: CallbackQuery):
         await callback.answer("Please login first using /start", show_alert=True)
         return
 
-    if data.startswith("open:"):
+    # New Account Switcher logic
+    if data == "view_accounts":
+        accounts = await db.get_user_accounts(user_id)
+        kb = []
+        for acc in accounts:
+            kb.append([InlineKeyboardButton(text=f"📂 {acc['email']}", callback_data=f"browse_acc:{acc['account_id']}")])
+        kb.append([InlineKeyboardButton(text="← Back to Root", callback_data="go_root")])
+        await callback.message.edit_text("<b>Select account to browse:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+    elif data.startswith("browse_acc:"):
+        await render_explorer(callback, data.split(":")[1], "root")
+
+    elif data.startswith("open:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
         if f_data: await render_explorer(callback, f_data['account_id'], f_data['file_id'])
@@ -488,7 +502,6 @@ async def handle_callback(callback: CallbackQuery):
         h = data.split(":")[1]
         await render_file_info(callback, h)
 
-    # [FIX] Download stream correctly and non-blocking
     elif data.startswith("down:"):
         h = data.split(":")[1]
         f_data = await db.callback_data.find_one({"hash": h})
@@ -511,7 +524,7 @@ async def handle_callback(callback: CallbackQuery):
         done = False
         while not done:
             _, done = await loop.run_in_executor(None, downloader.next_chunk)
-            await asyncio.sleep(0)  # yield to event loop between chunks
+            await asyncio.sleep(0)
         file_io.seek(0)
         decrypted_bytes = decrypt_data(file_io.read(), enc_on)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
@@ -538,7 +551,7 @@ async def handle_callback(callback: CallbackQuery):
         done = False
         while not done:
             _, done = await loop.run_in_executor(None, downloader.next_chunk)
-            await asyncio.sleep(0)  # yield to event loop between chunks
+            await asyncio.sleep(0)
         file_io.seek(0)
         decrypted_bytes = decrypt_data(file_io.read(), enabled=True)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
@@ -671,7 +684,7 @@ async def handle_user_input(message: Message):
     elif state['action'] == "login_username":
         username = message.text.strip()
         user_states[telegram_id] = {"action": "login_password", "username": username}
-        await message.answer("Enter your password:")
+        await message.answer("Enter your username:") # Note: This prompt text might be a typo in original ("Enter your password:" expected)
         return
     
     elif state['action'] == "login_password":
@@ -702,7 +715,22 @@ async def handle_user_input(message: Message):
             del user_states[telegram_id]
             await message.answer(f"<b>Backup account set:</b>\n{escape_html(email)}\n\nUse /settings to enable/disable backup.", parse_mode="HTML")
         else:
-            auth_url = build_oauth_url(user_id, telegram_id, is_backup=True)
+            state_key = f"{message.from_user.id}_{int(datetime.now().timestamp())}"
+            flow = Flow.from_client_config(
+                {
+                    "web": {
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                        "token_uri": "https://oauth2.googleapis.com/token"
+                    }
+                },
+                scopes=SCOPES,
+                redirect_uri=REDIRECT_URI
+            )
+            auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=state_key)
+            oauth_states[state_key] = {"user_id": user_id, "telegram_id": message.from_user.id, "flow": flow, "is_backup": True}
+            
             del user_states[telegram_id]
             await message.answer(f"Account with email <code>{escape_html(email)}</code> not found.\n\nClick below to add this account:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect as Backup Account", url=auth_url)]]), parse_mode="HTML")
         return
@@ -733,7 +761,6 @@ async def handle_user_input(message: Message):
         del user_states[telegram_id]
         await render_explorer(message, str(acc['_id']), state['parent_id'])
 
-    # [FIX] Non-blocking upload with Message Pinning and Safe Cleanup
     elif state['action'] in ["upload_file", "batch_upload"]:
         file_obj = None; filename = "untitled"
         if message.document: file_obj = message.document; filename = message.document.file_name
@@ -747,7 +774,6 @@ async def handle_user_input(message: Message):
 
             msg = await message.reply(f"Uploading <b>{escape_html(filename)}</b>...", parse_mode="HTML")
             
-            # PIN the message
             try:
                 await bot.pin_chat_message(chat_id=message.chat.id, message_id=msg.message_id, disable_notification=True)
             except Exception:
@@ -761,18 +787,20 @@ async def handle_user_input(message: Message):
                 enc_name = encrypt_name(filename, enc_on)
                 meta = {'name': enc_name, 'parents': [state['parent_id']] if state['parent_id'] != "root" else []}
                 
-                # Upload logic non-blocking
                 media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
                 await loop.run_in_executor(None, lambda: service.files().create(body=meta, media_body=media).execute())
                 
-                # Backup logic non-blocking
                 if await db.is_backup_enabled(user_id):
                     backup_acc = await db.get_backup_account(user_id)
                     if backup_acc:
                         try:
                             backup_service = get_drive_service(backup_acc['access_token'], backup_acc.get('refresh_token'))
                             backup_media = MediaIoBaseUpload(io.BytesIO(enc_bytes), mimetype='application/octet-stream')
-                            await loop.run_in_executor(None, lambda: backup_service.files().create(body=meta, media_body=backup_media).execute())
+                            
+                            # Fixed backup meta (no parent_id restriction)
+                            backup_meta = {'name': enc_name}
+                            
+                            await loop.run_in_executor(None, lambda: backup_service.files().create(body=backup_meta, media_body=backup_media).execute())
                             await msg.edit_text("Uploaded successfully (+ backup copy)")
                         except Exception as backup_error:
                             logger.error(f"Backup upload failed: {backup_error}")
@@ -785,17 +813,14 @@ async def handle_user_input(message: Message):
                 await msg.edit_text(f"Error: {e}")
                 
             finally:
-                # UNPIN when done or failed
                 try:
                     await bot.unpin_chat_message(chat_id=message.chat.id, message_id=msg.message_id)
                 except Exception:
                     pass
                 
-                # Ensure state is cleared so user isn't stuck
                 if state['action'] == "upload_file":
                     if telegram_id in user_states:
                         del user_states[telegram_id]
-                    # Attempt to refresh UI safely
                     try:
                         await render_explorer(message, str(acc['_id']), state['parent_id'])
                     except Exception:
@@ -804,7 +829,6 @@ async def handle_user_input(message: Message):
 # ============= TOKEN RECEIVER =============
 
 async def tokens_handler(request: web.Request):
-    """Receive tokens posted by the OAuth web flow."""
     try:
         payload = await request.json()
         telegram_id = payload.get("telegram_id")
@@ -837,7 +861,6 @@ async def tokens_handler(request: web.Request):
 async def main():
     global bot, db, dp
     
-    # === LOCAL SERVER LOGIC ADDED HERE ===
     if USE_LOCAL_SERVER:
         session = AiohttpSession(
             api=TelegramAPIServer.from_base(LOCAL_SERVER_URL, is_local=True)
@@ -847,7 +870,6 @@ async def main():
     else:
         bot = Bot(token=BOT_TOKEN)
         logger.info("Bot initialized using Standard Telegram API")
-    # =====================================
 
     db = Database()
     await db.create_indexes()
@@ -865,7 +887,6 @@ async def main():
     await set_bot_commands(bot)
     logger.info("Bot commands registered")
 
-    # Command handlers registration
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_files, Command("files"))
     dp.message.register(cmd_search, Command("search"))
@@ -878,7 +899,6 @@ async def main():
     dp.message.register(handle_user_input, F.text | F.document | F.video | F.audio | F.photo)
     dp.callback_query.register(handle_callback)
     
-    # ── Token receiver web server ──
     app = web.Application()
     app.router.add_post('/tokens', tokens_handler)
     runner = web.AppRunner(app)
