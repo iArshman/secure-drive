@@ -5,7 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from cryptography.fernet import Fernet
-import hashlib
+import uuid
 import os
 from config import MONGO_URI, DATABASE_NAME
 
@@ -53,7 +53,7 @@ class Database:
             {'$set': {'is_logged_in': False}}
         )
         
-        internal_id = int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15)
+        internal_id = uuid.uuid4().int % (10 ** 15)
         
         user_data = {
             'telegram_id': telegram_id,
@@ -86,7 +86,10 @@ class Database:
                 {'_id': user['_id']},
                 {'$set': {'telegram_id': telegram_id, 'is_logged_in': True, 'last_login': datetime.now(timezone.utc)}}
             )
-            internal_id = user.get('internal_user_id') or (int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15))
+            internal_id = user.get('internal_user_id')
+            if not internal_id:
+                internal_id = uuid.uuid4().int % (10 ** 15)
+                await self.auth_users.update_one({'_id': user['_id']}, {'$set': {'internal_user_id': internal_id}})
             return {'success': True, 'internal_user_id': internal_id}
         
         return {'success': False, 'internal_user_id': None}
@@ -184,12 +187,7 @@ class Database:
         await self.update_user(user_id, {'backup_account_id': account_id})
 
     async def get_backup_account(self, user_id: int) -> Optional[Dict]:
-        # Exclude the default account to avoid uploading twice to the same drive
-        default = await self.accounts.find_one({'user_id': user_id, 'is_default': True})
-        query = {'user_id': user_id, 'is_backup': True}
-        if default:
-            query['_id'] = {'$ne': default['_id']}
-        return await self.accounts.find_one(query)
+        return await self.accounts.find_one({'user_id': user_id, 'is_backup': True})
 
     async def toggle_backup(self, user_id: int, enabled: bool):
         await self.update_user(user_id, {'backup_enabled': enabled})
