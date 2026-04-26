@@ -5,7 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from cryptography.fernet import Fernet
-import uuid
+import hashlib
 import os
 from config import MONGO_URI, DATABASE_NAME
 
@@ -53,7 +53,7 @@ class Database:
             {'$set': {'is_logged_in': False}}
         )
         
-        internal_id = uuid.uuid4().int % (10 ** 15)
+        internal_id = int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15)
         
         user_data = {
             'telegram_id': telegram_id,
@@ -86,10 +86,7 @@ class Database:
                 {'_id': user['_id']},
                 {'$set': {'telegram_id': telegram_id, 'is_logged_in': True, 'last_login': datetime.now(timezone.utc)}}
             )
-            internal_id = user.get('internal_user_id')
-            if not internal_id:
-                internal_id = uuid.uuid4().int % (10 ** 15)
-                await self.auth_users.update_one({'_id': user['_id']}, {'$set': {'internal_user_id': internal_id}})
+            internal_id = user.get('internal_user_id') or (int(hashlib.sha256(username.encode()).hexdigest(), 16) % (10 ** 15))
             return {'success': True, 'internal_user_id': internal_id}
         
         return {'success': False, 'internal_user_id': None}
@@ -135,7 +132,21 @@ class Database:
         await self.users.update_one({'user_id': user_id}, {'$set': update_data})
 
     async def add_account(self, user_id: int, email: str, tokens: Dict) -> str:
-        account_data = {
+        # Upsert by (user_id, email) — reconnecting same Google account just refreshes tokens
+        existing = await self.accounts.find_one({'user_id': user_id, 'email': email})
+        if existing:
+            await self.accounts.update_one(
+                {'_id': existing['_id']},
+                {'$set': {
+                    'access_token': tokens['access_token'],
+                    'refresh_token': tokens.get('refresh_token') or existing.get('refresh_token'),
+                    'expires_at': tokens['expires_at'],
+                    'updated_at': datetime.now(timezone.utc)
+                }}
+            )
+            return str(existing['_id'])
+
+        result = await self.accounts.insert_one({
             'user_id': user_id,
             'email': email,
             'access_token': tokens['access_token'],
@@ -144,11 +155,11 @@ class Database:
             'is_default': False,
             'created_at': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc)
-        }
-        result = await self.accounts.insert_one(account_data)
+        })
         account_id = str(result.inserted_id)
-        accounts_count = await self.accounts.count_documents({'user_id': user_id})
-        if accounts_count == 1:
+        # Only auto-set as default if no default exists yet
+        has_default = await self.accounts.find_one({'user_id': user_id, 'is_default': True, '_id': {'$ne': result.inserted_id}})
+        if not has_default:
             await self.set_default_account(user_id, account_id)
         return account_id
 
@@ -176,7 +187,12 @@ class Database:
         await self.update_user(user_id, {'backup_account_id': account_id})
 
     async def get_backup_account(self, user_id: int) -> Optional[Dict]:
-        return await self.accounts.find_one({'user_id': user_id, 'is_backup': True})
+        # Exclude the default account to avoid uploading twice to the same drive
+        default = await self.accounts.find_one({'user_id': user_id, 'is_default': True})
+        query = {'user_id': user_id, 'is_backup': True}
+        if default:
+            query['_id'] = {'$ne': default['_id']}
+        return await self.accounts.find_one(query)
 
     async def toggle_backup(self, user_id: int, enabled: bool):
         await self.update_user(user_id, {'backup_enabled': enabled})
