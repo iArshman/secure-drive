@@ -67,11 +67,11 @@ async def enc(user_id: int) -> bool:
     return await db.is_encryption_enabled(user_id)
 
 def get_file_view(mime_type: str, name: str) -> str:
-    if mime_type == 'application/vnd.google-apps.folder': 
+    if mime_type == 'application/vnd.google-apps.folder':
         return f"📁 {name}"
     if "." in name and not name.endswith("."):
-        return name
-    return name
+        return f"📄 {name}"
+    return f"📎 {name}"
 
 def format_file_size(size_bytes):
     if not size_bytes: return "0 B"
@@ -188,29 +188,31 @@ async def render_explorer(event, account_id: str, folder_id: str = "root", page_
 
 async def render_file_info(callback: CallbackQuery, h: str):
     f_data = await db.callback_data.find_one({"hash": h})
-    if f_data:
-        acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
-        enc_on = await enc(acc['user_id'])
-        service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
-        
-        loop = asyncio.get_running_loop()
-        f = await loop.run_in_executor(None, lambda: service.files().get(fileId=f_data['file_id'], fields="id, name, size, mimeType, modifiedTime").execute())
-        real_name = decrypt_name(f['name'], enc_on)
-        
-        text = (f"<b>File Details</b>\nAccount: <code>{escape_html(acc['email'])}</code>\n━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
-        
-        download_row = [InlineKeyboardButton(text="⬇️ Download", callback_data=f"down:{h}")]
-        bot_decrypt_on = await db.is_bot_decrypt_enabled(acc['user_id'])
-        if enc_on and bot_decrypt_on:
-            download_row.append(InlineKeyboardButton(text="🔓 Decrypt & Download", callback_data=f"down_dec:{h}"))
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            download_row,
-            [InlineKeyboardButton(text="Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="Delete", callback_data=f"del:{h}")],
-            [InlineKeyboardButton(text="← Back", callback_data=f"open_parent:{h}")]
-        ])
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    if not f_data:
+        await callback.answer("File info expired. Please refresh the file list.", show_alert=True)
+        return
+    acc = await db.accounts.find_one({"_id": ObjectId(f_data['account_id'])})
+    enc_on = await enc(acc['user_id'])
+    service = get_drive_service(acc['access_token'], acc.get('refresh_token'))
+    
+    loop = asyncio.get_running_loop()
+    f = await loop.run_in_executor(None, lambda: service.files().get(fileId=f_data['file_id'], fields="id, name, size, mimeType, modifiedTime").execute())
+    real_name = decrypt_name(f['name'], enc_on)
+    
+    text = (f"<b>File Details</b>\nAccount: <code>{escape_html(acc['email'])}</code>\n━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Name:</b> {escape_html(real_name)}\n<b>Size:</b> {format_file_size(f.get('size'))}\n<b>Date:</b> {f.get('modifiedTime')[:10]}")
+    
+    download_row = [InlineKeyboardButton(text="⬇️ Download", callback_data=f"down:{h}")]
+    bot_decrypt_on = await db.is_bot_decrypt_enabled(acc['user_id'])
+    if enc_on and bot_decrypt_on:
+        download_row.append(InlineKeyboardButton(text="🔓 Decrypt & Download", callback_data=f"down_dec:{h}"))
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        download_row,
+        [InlineKeyboardButton(text="Rename", callback_data=f"ren:{h}"), InlineKeyboardButton(text="Delete", callback_data=f"del:{h}")],
+        [InlineKeyboardButton(text="← Back", callback_data=f"open_parent:{h}")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 async def render_settings(event, user_id: int):
     accounts = await db.accounts.find({"user_id": user_id}).to_list(length=10)
@@ -227,12 +229,7 @@ async def render_settings(event, user_id: int):
     bot_decrypt_enabled = await db.is_bot_decrypt_enabled(user_id)
 
     enc_status_text = "🔒 ON" if enc_enabled else "🔓 OFF"
-    # Show which username is logged in
-    auth_user = await db.auth_users.find_one({'user_id': user_id, 'is_logged_in': True}) or                 await db.auth_users.find_one({'internal_user_id': user_id, 'is_logged_in': True})
-    username = auth_user['username'] if auth_user else "Unknown"
-
-    text = f"<b>⚙️ Settings</b>\n"
-    text += f"👤 Logged in as: <b>{escape_html(username)}</b>\n\n"
+    text = f"<b>⚙️ Settings</b>\n\n"
     text += f"<b>Encryption:</b> {enc_status_text}\n"
     if enc_enabled:
         text += "<i>Files are encrypted on upload. Downloads are auto-decrypted.</i>\n\n"
@@ -299,24 +296,20 @@ async def render_settings(event, user_id: int):
 
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    
-    # [FIX] Clear any stuck states when starting
     if user_id in user_states:
         del user_states[user_id]
         
-    if await db.is_user_logged_in(user_id):
-        # Show which username is logged in
-        auth_user = await db.auth_users.find_one({'telegram_id': user_id, 'is_logged_in': True})
-        username = auth_user['username'] if auth_user else "Unknown"
+    auth_user = await db.auth_users.find_one({'telegram_id': user_id, 'is_logged_in': True})
+    
+    if auth_user:
+        username = auth_user.get('username', 'User')
         await message.answer(
-            f"<b>Secure Drive</b>\n"
-            f"👤 Logged in as: <b>{escape_html(username)}</b>\n\n"
+            f"👋 <b>Welcome back, {escape_html(username)}!</b>\n\n"
+            "<b>Secure Drive Menu:</b>\n"
             "/files - File Manager\n"
             "/upload - Secure Upload\n"
             "/search - Search Files\n"
-            "/storage - Check Storage\n"
             "/settings - Manage Accounts\n"
-            "/addaccount - Link Drive\n"
             "/logout - Logout",
             parse_mode="HTML"
         )
@@ -514,8 +507,9 @@ async def handle_callback(callback: CallbackQuery):
         file_io = io.BytesIO()
         downloader = MediaIoBaseDownload(file_io, request)
         done = False
-        while not done: 
+        while not done:
             _, done = await loop.run_in_executor(None, downloader.next_chunk)
+            await asyncio.sleep(0)  # yield to event loop between chunks
         file_io.seek(0)
         decrypted_bytes = decrypt_data(file_io.read(), enc_on)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
@@ -540,8 +534,9 @@ async def handle_callback(callback: CallbackQuery):
         file_io = io.BytesIO()
         downloader = MediaIoBaseDownload(file_io, request)
         done = False
-        while not done: 
+        while not done:
             _, done = await loop.run_in_executor(None, downloader.next_chunk)
+            await asyncio.sleep(0)  # yield to event loop between chunks
         file_io.seek(0)
         decrypted_bytes = decrypt_data(file_io.read(), enabled=True)
         await callback.message.answer_document(BufferedInputFile(decrypted_bytes, filename=real_name))
@@ -674,7 +669,7 @@ async def handle_user_input(message: Message):
     elif state['action'] == "login_username":
         username = message.text.strip()
         user_states[telegram_id] = {"action": "login_password", "username": username}
-        await message.answer("Enter your username:")
+        await message.answer("Enter your password:")
         return
     
     elif state['action'] == "login_password":
@@ -804,6 +799,37 @@ async def handle_user_input(message: Message):
                     except Exception:
                         pass
 
+# ============= TOKEN RECEIVER =============
+
+async def tokens_handler(request: web.Request):
+    """Receive tokens posted by the OAuth web flow."""
+    try:
+        payload = await request.json()
+        telegram_id = payload.get("telegram_id")
+        user_id = payload.get("user_id")
+        tokens = payload.get("tokens")
+        email = payload.get("email")
+        is_backup = payload.get("is_backup", False)
+
+        if not all([telegram_id, user_id, tokens, email]):
+            return web.json_response({"error": "Missing fields"}, status=400)
+
+        account_id = await db.add_account(user_id, email, tokens)
+
+        if is_backup:
+            await db.set_backup_account(user_id, account_id)
+
+        try:
+            label = "Backup Account" if is_backup else "Secure Drive"
+            await bot.send_message(telegram_id, f"✅ <b>{label} Linked:</b> {email}", parse_mode="HTML")
+        except Exception:
+            pass
+
+        return web.json_response({"ok": True})
+    except Exception as e:
+        logger.error(f"tokens_handler error: {e}")
+        return web.json_response({"error": "Internal error"}, status=500)
+
 # ============= MAIN =============
 
 async def main():
@@ -822,6 +848,8 @@ async def main():
     # =====================================
 
     db = Database()
+    await db.create_indexes()
+    logger.info("Database indexes ensured")
     dp = Dispatcher()
     
     try:
