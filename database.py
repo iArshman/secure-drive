@@ -132,36 +132,33 @@ class Database:
         await self.users.update_one({'user_id': user_id}, {'$set': update_data})
 
     async def add_account(self, user_id: int, email: str, tokens: Dict) -> str:
-        # Upsert by (user_id, email) — reconnecting same Google account just refreshes tokens
-        existing = await self.accounts.find_one({'user_id': user_id, 'email': email})
-        if existing:
-            await self.accounts.update_one(
-                {'_id': existing['_id']},
-                {'$set': {
-                    'access_token': tokens['access_token'],
-                    'refresh_token': tokens.get('refresh_token') or existing.get('refresh_token'),
-                    'expires_at': tokens['expires_at'],
-                    'updated_at': datetime.now(timezone.utc)
-                }}
-            )
-            return str(existing['_id'])
-
-        result = await self.accounts.insert_one({
-            'user_id': user_id,
-            'email': email,
-            'access_token': tokens['access_token'],
-            'refresh_token': tokens.get('refresh_token'),
-            'expires_at': tokens['expires_at'],
-            'is_default': False,
+    account_data = {
+        'access_token': tokens['access_token'],
+        'refresh_token': tokens.get('refresh_token'),
+        'expires_at': tokens['expires_at'],
+        'updated_at': datetime.now(timezone.utc)
+    }
+    
+    # Use update_one with upsert=True to update tokens if mail exists
+    result = await self.accounts.update_one(
+        {'user_id': user_id, 'email': email},
+        {'$set': account_data, '$setOnInsert': {
             'created_at': datetime.now(timezone.utc),
-            'updated_at': datetime.now(timezone.utc)
-        })
-        account_id = str(result.inserted_id)
-        # Only auto-set as default if no default exists yet
-        has_default = await self.accounts.find_one({'user_id': user_id, 'is_default': True, '_id': {'$ne': result.inserted_id}})
-        if not has_default:
-            await self.set_default_account(user_id, account_id)
-        return account_id
+            'is_default': False
+        }},
+        upsert=True
+    )
+    
+    # Get the ID (either existing or new)
+    acc = await self.accounts.find_one({'user_id': user_id, 'email': email})
+    account_id = str(acc['_id'])
+    
+    # If this is the only account, make it default
+    accounts_count = await self.accounts.count_documents({'user_id': user_id})
+    if accounts_count == 1:
+        await self.set_default_account(user_id, account_id)
+        
+    return account_id
 
     async def get_account(self, account_id: str) -> Optional[Dict]:
         from bson import ObjectId
