@@ -914,6 +914,10 @@ async def main():
 
     logger.info("Bot is running...")
     try:
+        # === TO STOP THE SPAM ===
+        await bot.delete_webhook(drop_pending_updates=True)
+        # ======================================
+        
         await dp.start_polling(bot)
     finally:
         await runner.cleanup()
